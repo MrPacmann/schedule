@@ -50,8 +50,13 @@ GROUP_BLOCK_SIZE: Final[int] = 5
 SESSION_CACHE_KEY: Final[str] = "_schedule_excel_cache"
 PARSED_SCHEDULE_CACHE_KEY: Final[str] = "_parsed_schedule_cache"
 MAX_CACHED_FILES: Final[int] = 20
-APP_VERSION: Final[str] = "1.8.0"
+APP_VERSION: Final[str] = "1.8.1"
 APP_CHANGELOG: Final[tuple[tuple[str, str, tuple[str, ...]], ...]] = (
+    (
+        "1.8.1",
+        "29.08.2026",
+        ("В возможных местах расписания теперь указывается аудитория занятия.",),
+    ),
     (
         "1.8.0",
         "28.08.2026",
@@ -1602,13 +1607,17 @@ def _schedule_place(records: pd.DataFrame) -> str:
 
     places: list[str] = []
     for record in records.to_dict(orient="records"):
+        details = [clean_cell(record["Группа"])]
+        auditorium = clean_cell(record["Аудитория"])
+        if auditorium:
+            details.append(f"ауд. {auditorium}")
+        details.append(clean_cell(record[SOURCE_COLUMN]))
         place = (
             f"{clean_cell(record['День недели'])}, "
             f"пара {clean_cell(record['Пара'])}, "
             f"неделя {clean_cell(record['Неделя'])}, "
             f"{clean_cell(record['Время'])}; "
-            f"{clean_cell(record['Группа'])}; "
-            f"{clean_cell(record[SOURCE_COLUMN])}"
+            f"{'; '.join(detail for detail in details if detail)}"
         )
         if place not in places:
             places.append(place)
