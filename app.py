@@ -50,8 +50,17 @@ GROUP_BLOCK_SIZE: Final[int] = 5
 SESSION_CACHE_KEY: Final[str] = "_schedule_excel_cache"
 PARSED_SCHEDULE_CACHE_KEY: Final[str] = "_parsed_schedule_cache"
 MAX_CACHED_FILES: Final[int] = 20
-APP_VERSION: Final[str] = "1.8.3"
+APP_VERSION: Final[str] = "1.8.4"
 APP_CHANGELOG: Final[tuple[tuple[str, str, tuple[str, ...]], ...]] = (
+    (
+        "1.8.4",
+        "29.08.2026",
+        (
+            "Замечания нагрузки объединяются по исходным строкам-потокам.",
+            "Группы одного потока показываются в одной строке.",
+            "Счётчики сверки теперь отражают строки исходного файла нагрузки.",
+        ),
+    ),
     (
         "1.8.3",
         "29.08.2026",
@@ -216,6 +225,7 @@ WORKLOAD_COLUMNS: Final[list[str]] = [
     "Семестр",
     "Строка нагрузки",
 ]
+WORKLOAD_ROWS_KEY_COLUMN: Final[str] = "__workload_rows"
 
 WORKLOAD_ISSUE_COLUMNS: Final[list[str]] = [
     "Статус",
@@ -1641,6 +1651,90 @@ def _schedule_place(records: pd.DataFrame) -> str:
     return "\n".join(places)
 
 
+def _collapse_schedule_place_values(values: Sequence[Any]) -> str:
+    """Объединяет группы в описаниях одного временного слота."""
+
+    slot_groups: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    unparsed_lines: list[str] = []
+    for value in values:
+        for line in _clean_multiline_cell(value).splitlines():
+            parts = [part.strip() for part in line.split(";")]
+            if len(parts) < 3:
+                if line and line not in unparsed_lines:
+                    unparsed_lines.append(line)
+                continue
+            key = (parts[0], tuple(parts[2:]))
+            groups = slot_groups.setdefault(key, [])
+            group = parts[1]
+            if group and group not in groups:
+                groups.append(group)
+
+    collapsed = [
+        "; ".join((slot, ", ".join(groups), *suffix))
+        for (slot, suffix), groups in slot_groups.items()
+    ]
+    return "\n".join([*collapsed, *unparsed_lines])
+
+
+def _collapse_workload_issue_records(
+    records: Sequence[dict[str, str]],
+) -> pd.DataFrame:
+    """Сворачивает замечания до одной строки исходного потока нагрузки."""
+
+    if not records:
+        return pd.DataFrame(columns=WORKLOAD_ISSUE_COLUMNS)
+
+    frame = pd.DataFrame.from_records(records)
+    group_columns = [
+        WORKLOAD_ROWS_KEY_COLUMN,
+        "Преподаватели по нагрузке",
+        "Дисциплина",
+        "Вид занятий",
+        "Семестр",
+    ]
+    collapsed_records: list[dict[str, str]] = []
+    for _, issues in frame.groupby(group_columns, sort=False, dropna=False):
+        first = issues.iloc[0]
+        collapsed_records.append(
+            {
+                "Статус": _join_unique(issues["Статус"].tolist(), separator="\n"),
+                "Проблема": _join_unique(
+                    issues["Проблема"].tolist(),
+                    separator="\n",
+                ),
+                "Преподаватели по нагрузке": clean_cell(
+                    first["Преподаватели по нагрузке"]
+                ),
+                "Дисциплина": clean_cell(first["Дисциплина"]),
+                "Вид занятий": clean_cell(first["Вид занятий"]),
+                "Группа": _join_unique(
+                    issues["Группа"].tolist(),
+                    separator=", ",
+                ),
+                "Семестр": clean_cell(first["Семестр"]),
+                "ФИО в расписании": _join_unique(
+                    issues["ФИО в расписании"].tolist(),
+                    separator="\n",
+                ),
+                "Предлагаемое ФИО": _join_unique(
+                    issues["Предлагаемое ФИО"].tolist(),
+                    separator="\n",
+                ),
+                "Возможная накладка": _join_unique(
+                    issues["Возможная накладка"].tolist(),
+                    separator="\n",
+                ),
+                "Возможное место в расписании": _collapse_schedule_place_values(
+                    issues["Возможное место в расписании"].tolist()
+                ),
+            }
+        )
+    return pd.DataFrame.from_records(
+        collapsed_records,
+        columns=WORKLOAD_ISSUE_COLUMNS,
+    )
+
+
 def _suggested_teacher_conflicts(
     blank_candidates: pd.DataFrame,
     schedule: pd.DataFrame,
@@ -1684,7 +1778,7 @@ def _find_transferred_workload_issues(
     workload: pd.DataFrame,
     schedule: pd.DataFrame,
     normalized_queries: Sequence[tuple[str, str]],
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]], set[str]]:
     """Находит занятия, оставшиеся в расписании после передачи нагрузки."""
 
     assignment_columns = [
@@ -1712,6 +1806,7 @@ def _find_transferred_workload_issues(
 
     issues: list[dict[str, str]] = []
     transferred_records: list[dict[str, str]] = []
+    transferred_workload_rows: set[str] = set()
     schedule_columns = [*assignment_columns, TEACHER_COLUMN]
     for key, candidates in selected_schedule.groupby(
         schedule_columns,
@@ -1748,6 +1843,11 @@ def _find_transferred_workload_issues(
             continue
 
         expected_teacher_text = ", ".join(expected_teachers)
+        workload_rows = {
+            clean_cell(value) for value in assignment["Строка нагрузки"].tolist()
+        }
+        workload_rows.discard("")
+        transferred_workload_rows.update(workload_rows)
         transfer_label = f"❌ По нагрузке передано: {expected_teacher_text}"
         matching_queries = [
             query
@@ -1802,9 +1902,10 @@ def _find_transferred_workload_issues(
                 "Предлагаемое ФИО": "",
                 "Возможная накладка": "",
                 "Возможное место в расписании": _schedule_place(candidates),
+                WORKLOAD_ROWS_KEY_COLUMN: ", ".join(sorted(workload_rows)),
             }
         )
-    return issues, transferred_records
+    return issues, transferred_records, transferred_workload_rows
 
 
 def audit_workload(
@@ -1877,8 +1978,8 @@ def audit_workload(
     suggestion_records: list[dict[str, str]] = []
     suggested_schedule_records: list[dict[str, str]] = []
     potential_schedule_records: list[dict[str, str]] = []
-    matched_assignments = 0
-    checked_assignments = 0
+    checked_workload_rows: set[str] = set()
+    failed_workload_rows: set[str] = set()
 
     for _, assignment in prepared_workload.groupby(
         assignment_columns,
@@ -1924,7 +2025,20 @@ def audit_workload(
             for surname in map(_teacher_surname_key, relevant_teachers)
             if surname
         }
-        checked_assignments += 1
+        selected_assignment = assignment[
+            assignment["Преподаватель нагрузки"].map(
+                lambda teacher: any(
+                    normalized_query in _normalize_search_text(teacher)
+                    for _, normalized_query in normalized_queries
+                )
+            )
+        ]
+        workload_rows = {
+            clean_cell(value)
+            for value in selected_assignment["Строка нагрузки"].tolist()
+        }
+        workload_rows.discard("")
+        checked_workload_rows.update(workload_rows)
 
         base_issue = {
             "Преподаватели по нагрузке": relevant_teacher_text,
@@ -1936,8 +2050,10 @@ def audit_workload(
             "Предлагаемое ФИО": "",
             "Возможная накладка": "",
             "Возможное место в расписании": "",
+            WORKLOAD_ROWS_KEY_COLUMN: ", ".join(sorted(workload_rows)),
         }
         if not group:
+            failed_workload_rows.update(workload_rows)
             error_records.append(
                 {
                     "Статус": "❌ Ошибка нагрузки",
@@ -1956,6 +2072,7 @@ def audit_workload(
             empty_schedule,
         )
         if exact_candidates.empty:
+            failed_workload_rows.update(workload_rows)
             problem = (
                 "Дисциплина отсутствует в расписании"
                 if subject_candidates.empty
@@ -2027,13 +2144,13 @@ def audit_workload(
             if surname
         }
         if relevant_surnames and relevant_surnames.issubset(scheduled_surnames):
-            matched_assignments += 1
             continue
 
         blank_candidates = exact_candidates[
             exact_candidates[TEACHER_COLUMN].map(clean_cell) == ""
         ]
         if not blank_candidates.empty:
+            failed_workload_rows.update(workload_rows)
             suggested_teacher = (
                 expected_teachers[0] if len(expected_teachers) == 1 else ""
             )
@@ -2087,6 +2204,7 @@ def audit_workload(
                         )
             continue
 
+        failed_workload_rows.update(workload_rows)
         error_records.append(
             {
                 "Статус": "❌ Несовпадение ФИО",
@@ -2097,7 +2215,7 @@ def audit_workload(
             }
         )
 
-    transferred_issues, transferred_schedule_records = (
+    transferred_issues, transferred_schedule_records, transferred_workload_rows = (
         _find_transferred_workload_issues(
             prepared_workload,
             schedule,
@@ -2105,13 +2223,13 @@ def audit_workload(
         )
     )
     error_records.extend(transferred_issues)
-    checked_assignments += len(transferred_issues)
+    checked_workload_rows.update(transferred_workload_rows)
+    failed_workload_rows.update(transferred_workload_rows)
 
-    errors = pd.DataFrame.from_records(error_records, columns=WORKLOAD_ISSUE_COLUMNS)
-    suggestions = pd.DataFrame.from_records(
-        suggestion_records,
-        columns=WORKLOAD_ISSUE_COLUMNS,
-    )
+    checked_assignments = len(checked_workload_rows)
+    matched_assignments = len(checked_workload_rows - failed_workload_rows)
+    errors = _collapse_workload_issue_records(error_records)
+    suggestions = _collapse_workload_issue_records(suggestion_records)
     suggested_records = pd.DataFrame.from_records(
         suggested_schedule_records,
         columns=INTERNAL_COLUMNS,
