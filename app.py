@@ -37,15 +37,55 @@ NAME_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"[а-яёa-z0-9+#]+",
     re.IGNORECASE,
 )
+WEEK_SEQUENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?<!\d)(?P<weeks>\d{1,2}(?:\s*(?:[,;]|[-–—])\s*\d{1,2})*)"
+    r"\s*н(?:\.|\b)",
+    re.IGNORECASE,
+)
 
 HEADER_SEARCH_ROWS: Final[int] = 10
 COMMON_COLUMNS_COUNT: Final[int] = 5
 FIRST_GROUP_COLUMN: Final[int] = 5
 GROUP_BLOCK_SIZE: Final[int] = 5
 SESSION_CACHE_KEY: Final[str] = "_schedule_excel_cache"
+PARSED_SCHEDULE_CACHE_KEY: Final[str] = "_parsed_schedule_cache"
 MAX_CACHED_FILES: Final[int] = 20
-APP_VERSION: Final[str] = "1.5.0"
+APP_VERSION: Final[str] = "1.8.0"
 APP_CHANGELOG: Final[tuple[tuple[str, str, tuple[str, ...]], ...]] = (
+    (
+        "1.8.0",
+        "28.08.2026",
+        (
+            "Ускорен повторный поиск по уже загруженным расписаниям.",
+            "Почти вдвое уменьшена память кэша одной серверной сессии.",
+            "Проверка аудиторий ограничена слотами выбранных преподавателей.",
+            "Накладки преподавателей учитывают конкретные учебные недели.",
+            "Исправлена высота многострочных записей в таблицах сайта.",
+            "Текст XLSX защищён от интерпретации как формулы.",
+            "Минимальная версия Streamlit синхронизирована с интерфейсом.",
+        ),
+    ),
+    (
+        "1.7.0",
+        "28.08.2026",
+        (
+            "Добавлена проверка занятости аудиторий.",
+            "Конфликты кабинетов ищутся по всем загруженным расписаниям.",
+            "Общая лекция одного предмета для нескольких групп не считается ошибкой.",
+            "Учитываются конкретные номера учебных недель внутри дисциплины.",
+            "Накладки аудиторий добавляются отдельным листом в XLSX.",
+        ),
+    ),
+    (
+        "1.6.0",
+        "28.08.2026",
+        (
+            "Накладки поддерживают три и более одновременных занятий.",
+            "Практики разных групп больше не объединяются в одно занятие.",
+            "Общие лекции нескольких групп по-прежнему не считаются накладкой.",
+            "Возможные места из нагрузки агрегируются по временному слоту.",
+        ),
+    ),
     (
         "1.5.0",
         "28.08.2026",
@@ -103,7 +143,24 @@ TEACHER_COLUMN: Final[str] = "Преподаватель"
 SOURCE_COLUMN: Final[str] = "Файл-источник"
 CONFLICT_COLUMN: Final[str] = "Накладка"
 SUGGESTED_COLUMN: Final[str] = "Подстановка из нагрузки"
+ROOM_CONFLICT_COLUMN: Final[str] = "Накладка аудитории"
 WORKLOAD_CLASS_TYPES: Final[frozenset[str]] = frozenset({"ЛК", "ПР"})
+REMOTE_ROOM_MARKERS: Final[tuple[str, ...]] = (
+    "дистанцион",
+    "онлайн",
+    "online",
+    "сдо",
+    "zoom",
+)
+NON_SPECIFIC_ROOM_MARKERS: Final[tuple[str, ...]] = (
+    "кафедра",
+    "база",
+)
+NON_SPECIFIC_ROOM_VALUES: Final[frozenset[str]] = frozenset({"вуц"})
+EXCLUDED_ROOM_MARKERS: Final[tuple[str, ...]] = (
+    *REMOTE_ROOM_MARKERS,
+    *NON_SPECIFIC_ROOM_MARKERS,
+)
 
 OUTPUT_COLUMNS: Final[list[str]] = [
     "День недели",
@@ -151,6 +208,22 @@ WORKLOAD_ISSUE_COLUMNS: Final[list[str]] = [
     "Предлагаемое ФИО",
     "Возможная накладка",
     "Возможное место в расписании",
+]
+
+ROOM_CONFLICT_COLUMNS: Final[list[str]] = [
+    QUERY_COLUMN,
+    "День недели",
+    "Пара",
+    "Время",
+    "Неделя",
+    "Учебные недели",
+    "Аудитория",
+    ROOM_CONFLICT_COLUMN,
+    "Преподаватели",
+    "Группы",
+    "Дисциплины",
+    "Виды занятий",
+    SOURCE_COLUMN,
 ]
 
 DISPLAY_COLUMNS: Final[list[str]] = [
@@ -256,6 +329,7 @@ class WorkloadAuditResult:
     errors: pd.DataFrame
     suggestions: pd.DataFrame
     suggested_records: pd.DataFrame
+    potential_conflicts: pd.DataFrame
 
 
 def _is_missing(value: Any) -> bool:
@@ -285,6 +359,25 @@ def clean_cell(value: Any) -> str:
 
     text = str(value).replace("\r", " ").replace("\n", " ").replace("\xa0", " ")
     return WHITESPACE_PATTERN.sub(" ", text).strip()
+
+
+def _clean_multiline_cell(value: Any) -> str:
+    """Очищает текст, сохраняя смысловые переносы между занятиями."""
+
+    if _is_missing(value):
+        return ""
+    lines = [
+        WHITESPACE_PATTERN.sub(" ", line.replace("\xa0", " ")).strip()
+        for line in str(value).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+def _excel_safe_text(value: Any, *, multiline: bool = False) -> str:
+    """Не позволяет пользовательскому тексту стать формулой в XLSX."""
+
+    text = _clean_multiline_cell(value) if multiline else clean_cell(value)
+    return f"'{text}" if text.lstrip().startswith("=") else text
 
 
 def _normalize_search_text(value: Any) -> str:
@@ -500,6 +593,49 @@ def read_excel_for_session(
         cache.pop(next(iter(cache)))
     session_state[SESSION_CACHE_KEY] = cache
     return dataframe
+
+
+def read_schedule_records_for_session(
+    file_content: bytes,
+    session_state: MutableMapping[str, Any],
+    file_digest: str | None = None,
+) -> pd.DataFrame:
+    """Кэширует уже распакованные строки расписания между rerun Streamlit."""
+
+    digest = file_digest or sha256(file_content).hexdigest()
+    cached_value = session_state.get(PARSED_SCHEDULE_CACHE_KEY)
+    cache = (
+        {
+            cached_digest: dataframe
+            for cached_digest, dataframe in cached_value.items()
+            if isinstance(cached_digest, str) and isinstance(dataframe, pd.DataFrame)
+        }
+        if isinstance(cached_value, dict)
+        else {}
+    )
+
+    cached_records = cache.get(digest)
+    if cached_records is not None:
+        cache.pop(digest)
+        cache[digest] = cached_records
+        session_state[PARSED_SCHEDULE_CACHE_KEY] = cache
+        return cached_records
+
+    source_df = read_excel_for_session(file_content, session_state)
+    try:
+        records = extract_schedule_records(source_df)
+    finally:
+        # После распаковки хранить одновременно исходную матрицу и плоские
+        # записи нет смысла: на сервере это почти удваивает память каждой сессии.
+        raw_cache = session_state.get(SESSION_CACHE_KEY)
+        if isinstance(raw_cache, dict):
+            raw_cache.pop(digest, None)
+            session_state[SESSION_CACHE_KEY] = raw_cache
+    cache[digest] = records
+    while len(cache) > MAX_CACHED_FILES:
+        cache.pop(next(iter(cache)))
+    session_state[PARSED_SCHEDULE_CACHE_KEY] = cache
+    return records
 
 
 def find_group_row(df: pd.DataFrame) -> int:
@@ -721,7 +857,10 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
         sort=False,
         dropna=False,
     ):
-        logical_lessons: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        logical_lessons: dict[
+            tuple[str, str, str, str, str],
+            dict[str, Any],
+        ] = {}
         for record in slot_records.to_dict(orient="records"):
             lesson_values = (
                 clean_cell(record["Время"]),
@@ -729,7 +868,19 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
                 clean_cell(record["Вид занятий"]),
                 clean_cell(record["Аудитория"]),
             )
-            lesson_key = tuple(_normalize_search_text(value) for value in lesson_values)
+            lesson_type_key = _normalize_lesson_type(lesson_values[2])
+            discipline_key = _normalize_room_conflict_discipline(lesson_values[1])
+            group = clean_cell(record["Группа"])
+            # Несколько групп одной лекции — одно занятие. Практики разных
+            # групп являются отдельными занятиями даже при одинаковом предмете.
+            non_lecture_group_key = "" if lesson_type_key == "ЛК" else group.upper()
+            lesson_key = (
+                _normalize_search_text(lesson_values[0]),
+                discipline_key,
+                _normalize_search_text(lesson_values[2]),
+                _normalize_search_text(lesson_values[3]),
+                non_lecture_group_key,
+            )
             lesson = logical_lessons.setdefault(
                 lesson_key,
                 {
@@ -737,15 +888,18 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
                     "discipline": lesson_values[1],
                     "lesson_type": lesson_values[2],
                     "auditorium": lesson_values[3],
-                    "suggested": False,
+                    "suggestion_labels": [],
                     "groups": [],
                     "sources": [],
+                    "weeks": set(),
                 },
             )
-            lesson["suggested"] = lesson["suggested"] or bool(
-                clean_cell(record[SUGGESTED_COLUMN])
+            lesson["weeks"].update(
+                _extract_lesson_weeks(lesson_values[1], record["Неделя"])
             )
-            group = clean_cell(record["Группа"])
+            suggestion_label = clean_cell(record[SUGGESTED_COLUMN])
+            if suggestion_label and suggestion_label not in lesson["suggestion_labels"]:
+                lesson["suggestion_labels"].append(suggestion_label)
             source = clean_cell(record[SOURCE_COLUMN])
             if group and group not in lesson["groups"]:
                 lesson["groups"].append(group)
@@ -754,16 +908,31 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
 
         lessons = list(logical_lessons.values())
         first_record = slot_records.iloc[0]
-        distinct_disciplines = {
-            _normalize_discipline(lesson["discipline"])
-            for lesson in lessons
-            if _normalize_discipline(lesson["discipline"])
+        all_weeks = sorted({week for lesson in lessons for week in lesson["weeks"]})
+        simultaneous_counts = {
+            week: sum(week in lesson["weeks"] for lesson in lessons)
+            for week in all_weeks
         }
-        conflict_text = (
-            f"⚠ {_lesson_count_text(len(distinct_disciplines))} одновременно"
-            if len(distinct_disciplines) > 1
-            else ""
-        )
+        maximum_simultaneous = max(simultaneous_counts.values(), default=0)
+        conflict_weeks = [
+            week for week, count in simultaneous_counts.items() if count > 1
+        ]
+        if maximum_simultaneous > 1:
+            normalized_week = _normalize_search_text(first_record["Неделя"])
+            default_weeks = (
+                set(range(1, 19, 2)) if normalized_week == "i" else set(range(2, 19, 2))
+            )
+            weeks_suffix = (
+                ""
+                if set(conflict_weeks) == default_weeks
+                else f" (учебные недели: {_format_week_numbers(conflict_weeks)})"
+            )
+            conflict_text = (
+                f"⚠ {_lesson_count_text(maximum_simultaneous)} одновременно"
+                f"{weeks_suffix}"
+            )
+        else:
+            conflict_text = ""
         display_records.append(
             {
                 QUERY_COLUMN: clean_cell(first_record[QUERY_COLUMN]),
@@ -771,14 +940,20 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
                     slot_records[TEACHER_COLUMN].tolist(),
                     separator="\n",
                 ),
-                SUGGESTED_COLUMN: (
-                    "⚠ ФИО подставлено из нагрузки"
-                    if any(lesson["suggested"] for lesson in lessons)
-                    else ""
+                SUGGESTED_COLUMN: _join_unique(
+                    [
+                        label
+                        for lesson in lessons
+                        for label in lesson["suggestion_labels"]
+                    ],
+                    separator="\n",
                 ),
                 "День недели": clean_cell(first_record["День недели"]),
                 "Пара": clean_cell(first_record["Пара"]),
-                "Время": "\n".join(lesson["time"] for lesson in lessons),
+                "Время": _join_unique(
+                    [lesson["time"] for lesson in lessons],
+                    separator="\n",
+                ),
                 "Неделя": clean_cell(first_record["Неделя"]),
                 CONFLICT_COLUMN: conflict_text,
                 "Группа": "\n".join(
@@ -800,6 +975,299 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
     return sort_internal_schedule(
         display_frame,
         parse_teacher_queries(records[QUERY_COLUMN].tolist()),
+    )
+
+
+def _is_physical_room(value: Any) -> bool:
+    """Отбрасывает пустые и дистанционные значения аудитории."""
+
+    room = _normalize_search_text(value)
+    if not room or room in {"-", "—"}:
+        return False
+    if room in NON_SPECIFIC_ROOM_VALUES:
+        return False
+    return not any(marker in room for marker in EXCLUDED_ROOM_MARKERS)
+
+
+def _normalize_room_conflict_discipline(value: Any) -> str:
+    """Убирает номера недель перед сравнением названий общих лекций."""
+
+    without_weeks = WEEK_SEQUENCE_PATTERN.sub(" ", clean_cell(value))
+    return _normalize_discipline(without_weeks)
+
+
+def _extract_lesson_weeks(discipline: Any, week_type: Any) -> frozenset[int]:
+    """Извлекает фактические недели занятия или возвращает недели I/II."""
+
+    weeks: set[int] = set()
+    for match in WEEK_SEQUENCE_PATTERN.finditer(clean_cell(discipline)):
+        for part in re.split(r"\s*[,;]\s*", match.group("weeks")):
+            range_match = re.fullmatch(r"(\d{1,2})\s*[-–—]\s*(\d{1,2})", part)
+            if range_match is None:
+                week_number = int(part)
+                if 1 <= week_number <= 20:
+                    weeks.add(week_number)
+                continue
+            range_start, range_end = map(int, range_match.groups())
+            if range_start > range_end:
+                range_start, range_end = range_end, range_start
+            weeks.update(range(max(1, range_start), min(20, range_end) + 1))
+
+    if weeks:
+        return frozenset(weeks)
+
+    normalized_week = _normalize_search_text(week_type)
+    if normalized_week == "i":
+        return frozenset(range(1, 19, 2))
+    if normalized_week == "ii":
+        return frozenset(range(2, 19, 2))
+    return frozenset()
+
+
+def _format_week_numbers(weeks: Sequence[int]) -> str:
+    """Форматирует номера фактических учебных недель по возрастанию."""
+
+    return ", ".join(str(week) for week in sorted(set(weeks)))
+
+
+def find_room_conflicts(
+    schedule_records: pd.DataFrame,
+    teacher_queries: Sequence[str],
+) -> pd.DataFrame:
+    """Ищет двойное бронирование кабинетов для выбранных преподавателей.
+
+    Сравнение выполняется по всему загруженному расписанию. Несколько групп
+    одной и той же лекции в одном кабинете считаются одним занятием.
+    """
+
+    queries = parse_teacher_queries(teacher_queries)
+    if not queries or schedule_records.empty:
+        return pd.DataFrame(columns=ROOM_CONFLICT_COLUMNS)
+    normalized_queries = [(query, _normalize_search_text(query)) for query in queries]
+
+    schedule = schedule_records.reindex(columns=ALL_SCHEDULE_COLUMNS).copy()
+    schedule = schedule[schedule["Аудитория"].map(_is_physical_room)].copy()
+    if schedule.empty:
+        return pd.DataFrame(columns=ROOM_CONFLICT_COLUMNS)
+
+    schedule["__day_key"] = schedule["День недели"].map(_day_sort_key)
+    schedule["__pair_key"] = schedule["Пара"].map(_format_pair)
+    schedule["__room_key"] = schedule["Аудитория"].map(_normalize_search_text)
+    schedule = schedule[
+        (schedule["__day_key"] <= 5)
+        & (schedule["__pair_key"] != "")
+        & (schedule["Неделя"].map(_normalize_search_text) != "")
+    ]
+    schedule["__teacher_key"] = schedule[TEACHER_COLUMN].map(_normalize_search_text)
+    selected_teacher_mask = schedule["__teacher_key"].map(
+        lambda teacher: any(
+            normalized_query in teacher for _, normalized_query in normalized_queries
+        )
+    )
+    relevant_slots = set(
+        schedule.loc[
+            selected_teacher_mask,
+            ["__day_key", "__pair_key", "__room_key"],
+        ].itertuples(index=False, name=None)
+    )
+    if not relevant_slots:
+        return pd.DataFrame(columns=ROOM_CONFLICT_COLUMNS)
+    schedule = schedule[
+        [
+            slot in relevant_slots
+            for slot in schedule[["__day_key", "__pair_key", "__room_key"]].itertuples(
+                index=False, name=None
+            )
+        ]
+    ]
+
+    conflict_records: list[dict[str, str]] = []
+    slot_columns = ["__day_key", "__pair_key", "__room_key"]
+    for _, slot_records in schedule.groupby(
+        slot_columns,
+        sort=False,
+        dropna=False,
+    ):
+        occupancies: dict[tuple[str, ...], dict[str, Any]] = {}
+        for record_index, record in enumerate(slot_records.to_dict(orient="records")):
+            discipline = clean_cell(record["Дисциплина"])
+            discipline_key = _normalize_room_conflict_discipline(discipline)
+            lesson_type = _normalize_lesson_type(record["Вид занятий"])
+            group = clean_cell(record["Группа"]).upper()
+            teacher = clean_cell(record[TEACHER_COLUMN])
+            source = clean_cell(record[SOURCE_COLUMN])
+
+            if lesson_type == "ЛК" and discipline_key:
+                # Общая лекция одного предмета может занимать одну аудиторию
+                # сразу для нескольких групп и преподавателей.
+                occupancy_key = ("lecture", discipline_key)
+            else:
+                group_identity = group or _teacher_surname_key(teacher)
+                occupancy_key = (
+                    "lesson",
+                    discipline_key or f"row-{record_index}",
+                    lesson_type,
+                    group_identity or source or f"row-{record_index}",
+                )
+
+            occupancy = occupancies.setdefault(
+                occupancy_key,
+                {
+                    "teachers": [],
+                    "groups": [],
+                    "disciplines": [],
+                    "lesson_types": [],
+                    "sources": [],
+                    "times": [],
+                    "week_types": [],
+                    "weeks": set(),
+                },
+            )
+            for field, value in (
+                ("teachers", teacher),
+                ("groups", group),
+                ("disciplines", discipline),
+                ("lesson_types", clean_cell(record["Вид занятий"])),
+                ("sources", source),
+                ("times", clean_cell(record["Время"])),
+                ("week_types", clean_cell(record["Неделя"])),
+            ):
+                if value and value not in occupancy[field]:
+                    occupancy[field].append(value)
+            occupancy["weeks"].update(
+                _extract_lesson_weeks(discipline, record["Неделя"])
+            )
+
+        if len(occupancies) <= 1:
+            continue
+
+        conflicting_signatures: dict[tuple[tuple[str, ...], ...], list[int]] = {}
+        occupancy_keys = list(occupancies)
+        all_weeks = sorted(
+            {week for occupancy in occupancies.values() for week in occupancy["weeks"]}
+        )
+        for week in all_weeks:
+            signature = tuple(
+                occupancy_key
+                for occupancy_key in occupancy_keys
+                if week in occupancies[occupancy_key]["weeks"]
+            )
+            if len(signature) > 1:
+                conflicting_signatures.setdefault(signature, []).append(week)
+
+        first = slot_records.iloc[0]
+        for signature, conflict_weeks in conflicting_signatures.items():
+            logical_lessons = [occupancies[key] for key in signature]
+            matching_teacher_values = [
+                teacher for lesson in logical_lessons for teacher in lesson["teachers"]
+            ]
+            matched_queries = [
+                query
+                for query, normalized_query in normalized_queries
+                if any(
+                    normalized_query in _normalize_search_text(teacher)
+                    for teacher in matching_teacher_values
+                )
+            ]
+            if not matched_queries:
+                continue
+
+            conflict_records.append(
+                {
+                    QUERY_COLUMN: ", ".join(matched_queries),
+                    "День недели": clean_cell(first["День недели"]),
+                    "Пара": clean_cell(first["Пара"]),
+                    "Время": _join_unique(
+                        [
+                            lesson_time
+                            for lesson in logical_lessons
+                            for lesson_time in lesson["times"]
+                        ],
+                        "\n",
+                    ),
+                    "Неделя": _join_unique(
+                        [
+                            week_type
+                            for lesson in logical_lessons
+                            for week_type in lesson["week_types"]
+                        ]
+                    ),
+                    "Учебные недели": _format_week_numbers(conflict_weeks),
+                    "Аудитория": clean_cell(first["Аудитория"]),
+                    ROOM_CONFLICT_COLUMN: (
+                        f"⚠ {_lesson_count_text(len(logical_lessons))} "
+                        "в одной аудитории"
+                    ),
+                    "Преподаватели": "\n".join(
+                        _join_unique(lesson["teachers"]) for lesson in logical_lessons
+                    ),
+                    "Группы": "\n".join(
+                        _join_unique(lesson["groups"]) for lesson in logical_lessons
+                    ),
+                    "Дисциплины": "\n".join(
+                        _join_unique(lesson["disciplines"])
+                        for lesson in logical_lessons
+                    ),
+                    "Виды занятий": "\n".join(
+                        _join_unique(lesson["lesson_types"])
+                        for lesson in logical_lessons
+                    ),
+                    SOURCE_COLUMN: "\n".join(
+                        _join_unique(lesson["sources"]) for lesson in logical_lessons
+                    ),
+                }
+            )
+
+    conflicts = pd.DataFrame.from_records(
+        conflict_records,
+        columns=ROOM_CONFLICT_COLUMNS,
+    )
+    if conflicts.empty:
+        return conflicts
+
+    query_order = {
+        _normalize_search_text(query): position
+        for position, query in enumerate(queries)
+    }
+    sortable = conflicts.copy()
+    sortable["__query_order"] = sortable[QUERY_COLUMN].map(
+        lambda value: min(
+            (
+                query_order[_normalize_search_text(query)]
+                for query in parse_teacher_queries(value)
+                if _normalize_search_text(query) in query_order
+            ),
+            default=len(query_order),
+        )
+    )
+    sortable["__day_order"] = sortable["День недели"].map(_day_sort_key)
+    sortable["__pair_order"] = sortable["Пара"].map(_pair_sort_key)
+    sortable["__week_order"] = sortable["Учебные недели"].map(
+        lambda value: min(
+            (int(part) for part in clean_cell(value).split(", ") if part.isdigit()),
+            default=99,
+        )
+    )
+    return (
+        sortable.sort_values(
+            by=[
+                "__query_order",
+                "__day_order",
+                "__pair_order",
+                "__week_order",
+                "Аудитория",
+            ],
+            kind="mergesort",
+        )
+        .drop(
+            columns=[
+                "__query_order",
+                "__day_order",
+                "__pair_order",
+                "__week_order",
+            ]
+        )
+        .reset_index(drop=True)
     )
 
 
@@ -988,8 +1456,12 @@ def parse_schedule_files(
         seen_digests.add(file_digest)
 
         try:
-            source_df = read_excel_for_session(file_content, session_state)
-            all_parsed = extract_schedule_records(source_df, filename)
+            cached_records = read_schedule_records_for_session(
+                file_content,
+                session_state,
+                file_digest,
+            )
+            all_parsed = cached_records.assign(**{SOURCE_COLUMN: filename})
             parsed = _filter_schedule_records(all_parsed, queries)
         except ScheduleError as exc:
             errors.append(BatchFileError(filename, str(exc)))
@@ -1154,31 +1626,26 @@ def _suggested_teacher_conflicts(
     surname = _teacher_surname_key(suggested_teacher)
     if not surname:
         return ""
-    teacher_schedule = schedule[
-        schedule[TEACHER_COLUMN].map(_teacher_surname_key) == surname
-    ]
+    teacher_schedule = schedule[schedule["__teacher_surname"] == surname]
     conflicts: list[str] = []
     for candidate in blank_candidates.to_dict(orient="records"):
+        candidate_weeks = _extract_lesson_weeks(
+            candidate["Дисциплина"],
+            candidate["Неделя"],
+        )
         same_slot = teacher_schedule[
-            (
-                teacher_schedule["День недели"].map(_day_sort_key)
-                == _day_sort_key(candidate["День недели"])
-            )
-            & (
-                teacher_schedule["Пара"].map(_format_pair)
-                == _format_pair(candidate["Пара"])
-            )
-            & (
-                teacher_schedule["Неделя"].map(_normalize_search_text)
-                == _normalize_search_text(candidate["Неделя"])
-            )
+            (teacher_schedule["__day_key"] == _day_sort_key(candidate["День недели"]))
+            & (teacher_schedule["__pair_key"] == _format_pair(candidate["Пара"]))
             & (teacher_schedule["__discipline_key"] != suggested_discipline_key)
         ]
         for conflict in same_slot.to_dict(orient="records"):
+            common_weeks = candidate_weeks.intersection(conflict["__lesson_weeks"])
+            if not common_weeks:
+                continue
             description = (
                 f"{clean_cell(conflict['День недели'])}, "
                 f"пара {clean_cell(conflict['Пара'])}, "
-                f"неделя {clean_cell(conflict['Неделя'])}: "
+                f"учебные недели {_format_week_numbers(common_weeks)}: "
                 f"{clean_cell(conflict['Дисциплина'])} "
                 f"({clean_cell(conflict['Группа'])})"
             )
@@ -1199,6 +1666,7 @@ def audit_workload(
     queries = parse_teacher_queries(teacher_queries)
     if not queries:
         raise ValueError("Введите хотя бы одну фамилию для сверки нагрузки.")
+    normalized_queries = [(query, _normalize_search_text(query)) for query in queries]
 
     schedule = schedule_records.reindex(columns=ALL_SCHEDULE_COLUMNS).copy()
     schedule["__discipline_key"] = schedule["Дисциплина"].map(_normalize_discipline)
@@ -1206,6 +1674,34 @@ def audit_workload(
     schedule["__group_key"] = schedule["Группа"].map(
         lambda value: clean_cell(value).upper()
     )
+    schedule["__teacher_surname"] = schedule[TEACHER_COLUMN].map(_teacher_surname_key)
+    schedule["__day_key"] = schedule["День недели"].map(_day_sort_key)
+    schedule["__pair_key"] = schedule["Пара"].map(_format_pair)
+    schedule["__lesson_weeks"] = [
+        _extract_lesson_weeks(discipline, week_type)
+        for discipline, week_type in zip(
+            schedule["Дисциплина"],
+            schedule["Неделя"],
+            strict=True,
+        )
+    ]
+    empty_schedule = schedule.iloc[0:0]
+    subject_candidates_by_key = {
+        clean_cell(key): group
+        for key, group in schedule.groupby(
+            "__discipline_key",
+            sort=False,
+            dropna=False,
+        )
+    }
+    exact_candidates_by_key = {
+        tuple(clean_cell(value) for value in key): group
+        for key, group in schedule.groupby(
+            ["__discipline_key", "__lesson_type_key", "__group_key"],
+            sort=False,
+            dropna=False,
+        )
+    }
 
     prepared_workload = workload.copy()
     prepared_workload["__discipline_key"] = prepared_workload["Дисциплина"].map(
@@ -1221,6 +1717,7 @@ def audit_workload(
     error_records: list[dict[str, str]] = []
     suggestion_records: list[dict[str, str]] = []
     suggested_schedule_records: list[dict[str, str]] = []
+    potential_schedule_records: list[dict[str, str]] = []
     matched_assignments = 0
     checked_assignments = 0
 
@@ -1245,9 +1742,9 @@ def audit_workload(
         ]
         matching_queries = [
             query
-            for query in queries
+            for query, normalized_query in normalized_queries
             if any(
-                _normalize_search_text(query) in _normalize_search_text(teacher)
+                normalized_query in _normalize_search_text(teacher)
                 for teacher in expected_teachers
             )
         ]
@@ -1291,11 +1788,14 @@ def audit_workload(
             )
             continue
 
-        subject_candidates = schedule[schedule["__discipline_key"] == discipline_key]
-        exact_candidates = subject_candidates[
-            (subject_candidates["__lesson_type_key"] == lesson_type)
-            & (subject_candidates["__group_key"] == group)
-        ]
+        subject_candidates = subject_candidates_by_key.get(
+            discipline_key,
+            empty_schedule,
+        )
+        exact_candidates = exact_candidates_by_key.get(
+            (discipline_key, lesson_type, group),
+            empty_schedule,
+        )
         if exact_candidates.empty:
             problem = (
                 "Дисциплина отсутствует в расписании"
@@ -1313,6 +1813,47 @@ def audit_workload(
                 }
             )
             continue
+
+        for candidate in exact_candidates.to_dict(orient="records"):
+            scheduled_teacher = clean_cell(candidate[TEACHER_COLUMN])
+            scheduled_surname = _teacher_surname_key(scheduled_teacher)
+            for relevant_teacher in relevant_teachers:
+                relevant_surname = _teacher_surname_key(relevant_teacher)
+                if scheduled_surname == relevant_surname:
+                    workload_status = ""
+                elif not scheduled_teacher and len(expected_teachers) == 1:
+                    workload_status = "⚠ Однозначная подстановка из нагрузки"
+                elif not scheduled_teacher:
+                    workload_status = (
+                        "❔ Возможное занятие: в нагрузке несколько преподавателей"
+                    )
+                else:
+                    workload_status = (
+                        "❗ В расписании указан другой преподаватель: "
+                        f"{scheduled_teacher}"
+                    )
+
+                for query in matching_queries:
+                    if _normalize_search_text(query) not in _normalize_search_text(
+                        relevant_teacher
+                    ):
+                        continue
+                    potential_schedule_records.append(
+                        {
+                            QUERY_COLUMN: query,
+                            TEACHER_COLUMN: relevant_teacher,
+                            SUGGESTED_COLUMN: workload_status,
+                            "День недели": clean_cell(candidate["День недели"]),
+                            "Пара": clean_cell(candidate["Пара"]),
+                            "Время": clean_cell(candidate["Время"]),
+                            "Неделя": clean_cell(candidate["Неделя"]),
+                            "Группа": clean_cell(candidate["Группа"]),
+                            "Дисциплина": clean_cell(candidate["Дисциплина"]),
+                            "Вид занятий": clean_cell(candidate["Вид занятий"]),
+                            "Аудитория": clean_cell(candidate["Аудитория"]),
+                            SOURCE_COLUMN: clean_cell(candidate[SOURCE_COLUMN]),
+                        }
+                    )
 
         scheduled_teachers = [
             teacher
@@ -1411,12 +1952,40 @@ def audit_workload(
             suggested_records,
             queries,
         )
+
+    potential_records = pd.DataFrame.from_records(
+        potential_schedule_records,
+        columns=INTERNAL_COLUMNS,
+    )
+    confirmed_records = _filter_schedule_records(schedule_records, queries)
+    combined_potential_records = pd.concat(
+        [confirmed_records, potential_records],
+        ignore_index=True,
+    )
+    if combined_potential_records.empty:
+        potential_conflicts = pd.DataFrame(columns=DISPLAY_COLUMNS)
+    else:
+        combined_potential_records = combined_potential_records.drop_duplicates(
+            subset=[QUERY_COLUMN, *OUTPUT_COLUMNS],
+            keep="first",
+            ignore_index=True,
+        )
+        combined_potential_records = sort_internal_schedule(
+            combined_potential_records,
+            queries,
+        )
+        potential_schedule = collapse_schedule_conflicts(combined_potential_records)
+        potential_conflicts = potential_schedule[
+            potential_schedule[CONFLICT_COLUMN].map(clean_cell) != ""
+        ].reset_index(drop=True)
+
     return WorkloadAuditResult(
         checked_assignments=checked_assignments,
         matched_assignments=matched_assignments,
         errors=errors,
         suggestions=suggestions,
         suggested_records=suggested_records,
+        potential_conflicts=potential_conflicts,
     )
 
 
@@ -1437,6 +2006,29 @@ def merge_workload_suggestions(
         ignore_index=True,
     )
     return _deduplicate_batch_records(combined, teacher_queries)
+
+
+def merge_all_schedule_suggestions(
+    schedule_records: pd.DataFrame,
+    audit: WorkloadAuditResult | None,
+) -> pd.DataFrame:
+    """Добавляет однозначные подстановки в полный набор для проверки кабинетов."""
+
+    original = schedule_records.reindex(columns=ALL_SCHEDULE_COLUMNS)
+    if audit is None or audit.suggested_records.empty:
+        return original
+    combined = pd.concat(
+        [
+            original,
+            audit.suggested_records.reindex(columns=ALL_SCHEDULE_COLUMNS),
+        ],
+        ignore_index=True,
+    )
+    return combined.drop_duplicates(
+        subset=[TEACHER_COLUMN, *OUTPUT_COLUMNS],
+        keep="first",
+        ignore_index=True,
+    )
 
 
 def _pair_number(value: Any) -> int | None:
@@ -1516,15 +2108,23 @@ def _export_clusters_for_query(
         if day_order > 5 or pair_number is None or week_order is None:
             continue
 
+        lesson_type = clean_cell(record["Вид занятий"])
+        discipline = clean_cell(record["Дисциплина"])
+        group = clean_cell(record["Группа"])
+        non_lecture_group_key = (
+            "" if _normalize_lesson_type(lesson_type) == "ЛК" else group.upper()
+        )
+
         key = (
             day_order,
             pair_number,
             week_order,
             _teacher_conflict_identity(query, record[TEACHER_COLUMN]),
             _normalize_search_text(record["Время"]),
-            _normalize_search_text(record["Дисциплина"]),
+            _normalize_room_conflict_discipline(discipline),
             _normalize_search_text(record["Вид занятий"]),
             _normalize_search_text(record["Аудитория"]),
+            non_lecture_group_key,
         )
         cluster = clusters.setdefault(
             key,
@@ -1536,16 +2136,17 @@ def _export_clusters_for_query(
                 "teacher": clean_cell(record[TEACHER_COLUMN]),
                 "suggested": False,
                 "time": clean_cell(record["Время"]),
-                "discipline": clean_cell(record["Дисциплина"]),
-                "lesson_type": clean_cell(record["Вид занятий"]),
+                "discipline": discipline,
+                "lesson_type": lesson_type,
                 "auditorium": clean_cell(record["Аудитория"]),
                 "groups": [],
+                "weeks": set(),
             },
         )
+        cluster["weeks"].update(_extract_lesson_weeks(discipline, record["Неделя"]))
         cluster["suggested"] = cluster["suggested"] or bool(
             clean_cell(record.get(SUGGESTED_COLUMN, ""))
         )
-        group = clean_cell(record["Группа"])
         if group and group not in cluster["groups"]:
             cluster["groups"].append(group)
 
@@ -1563,11 +2164,112 @@ def _export_clusters_for_query(
     return result
 
 
+def _append_room_conflicts_sheet(
+    workbook: Workbook,
+    room_conflicts: pd.DataFrame,
+) -> None:
+    """Добавляет в книгу отдельный оформленный лист конфликтов кабинетов."""
+
+    if room_conflicts.empty:
+        return
+
+    worksheet = workbook.create_sheet("Накладки аудиторий")
+    worksheet.sheet_view.showGridLines = False
+    worksheet.sheet_view.zoomScale = 80
+    worksheet.freeze_panes = "A4"
+    worksheet.page_setup.orientation = "landscape"
+    worksheet.page_setup.fitToWidth = 1
+    worksheet.page_setup.fitToHeight = 0
+    worksheet.sheet_properties.pageSetUpPr.fitToPage = True
+
+    total_columns = len(ROOM_CONFLICT_COLUMNS)
+    last_column_letter = get_column_letter(total_columns)
+    title_fill = PatternFill("solid", fgColor="9C0006")
+    header_fill = PatternFill("solid", fgColor="C00000")
+    note_fill = PatternFill("solid", fgColor="FFF2CC")
+    conflict_fill = PatternFill("solid", fgColor="FCE4D6")
+    thin_red = Side(style="thin", color="C00000")
+    border = Border(left=thin_red, right=thin_red, top=thin_red, bottom=thin_red)
+
+    worksheet.merge_cells(f"A1:{last_column_letter}1")
+    worksheet["A1"] = "Накладки аудиторий выбранных преподавателей"
+    worksheet["A1"].fill = title_fill
+    worksheet["A1"].font = Font(name="Arial", size=16, bold=True, color="FFFFFF")
+    worksheet["A1"].alignment = Alignment(
+        horizontal="center",
+        vertical="center",
+    )
+
+    worksheet.merge_cells(f"A2:{last_column_letter}2")
+    worksheet["A2"] = (
+        "Проверка выполнена по всем загруженным файлам. Общая лекция одного "
+        "предмета для нескольких групп не считается конфликтом."
+    )
+    worksheet["A2"].fill = note_fill
+    worksheet["A2"].font = Font(name="Arial", size=10, italic=True, color="7F6000")
+    worksheet["A2"].alignment = Alignment(
+        horizontal="left",
+        vertical="center",
+        wrap_text=True,
+    )
+
+    for column_index, column_name in enumerate(ROOM_CONFLICT_COLUMNS, start=1):
+        cell = worksheet.cell(3, column_index, column_name)
+        cell.fill = header_fill
+        cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        cell.border = border
+
+    export_frame = room_conflicts.reindex(columns=ROOM_CONFLICT_COLUMNS).fillna("")
+    for row_index, record in enumerate(
+        export_frame.itertuples(index=False, name=None),
+        start=4,
+    ):
+        maximum_lines = 1
+        for column_index, value in enumerate(record, start=1):
+            text_value = _excel_safe_text(value, multiline=True)
+            maximum_lines = max(maximum_lines, len(text_value.splitlines()))
+            cell = worksheet.cell(row_index, column_index, text_value)
+            cell.fill = conflict_fill
+            cell.font = Font(
+                name="Arial",
+                size=10,
+                bold=column_index in {7, 8},
+                color="9C0006" if column_index == 8 else "000000",
+            )
+            cell.alignment = Alignment(
+                horizontal="center" if column_index in {2, 3, 4, 5, 6, 7} else "left",
+                vertical="top",
+                wrap_text=True,
+            )
+            cell.border = border
+        worksheet.row_dimensions[row_index].height = min(
+            360,
+            max(30, 18 + maximum_lines * 18),
+        )
+
+    worksheet.row_dimensions[1].height = 30
+    worksheet.row_dimensions[2].height = 34
+    worksheet.row_dimensions[3].height = 36
+    column_widths = (26, 14, 8, 18, 10, 18, 22, 28, 32, 26, 38, 16, 42)
+    for column_index, width in enumerate(column_widths, start=1):
+        worksheet.column_dimensions[get_column_letter(column_index)].width = width
+
+    worksheet.auto_filter.ref = f"A3:{last_column_letter}{worksheet.max_row}"
+    worksheet.print_title_rows = "1:3"
+    worksheet.print_area = f"A1:{last_column_letter}{worksheet.max_row}"
+
+
 def build_schedule_xlsx(
     records: pd.DataFrame,
     teacher_queries: Sequence[str],
+    room_conflicts: pd.DataFrame | None = None,
 ) -> bytes:
-    """Создаёт цветную матрицу расписания в формате XLSX по образцу."""
+    """Создаёт цветную матрицу и лист конфликтов кабинетов в XLSX."""
 
     queries = parse_teacher_queries(teacher_queries)
     if not queries:
@@ -1687,7 +2389,9 @@ def build_schedule_xlsx(
                 end_row=1,
                 end_column=end_column,
             )
-            worksheet.cell(1, start_column, header_value)
+            worksheet.cell(
+                1, start_column, _excel_safe_text(header_value, multiline=True)
+            )
 
             for column in range(start_column, end_column + 1):
                 header_cell = worksheet.cell(1, column)
@@ -1761,22 +2465,19 @@ def build_schedule_xlsx(
                             ),
                             [],
                         )
-                        disciplines_by_teacher: dict[str, set[str]] = {}
+                        lesson_counts_by_teacher: dict[str, Counter[int]] = {}
                         for cluster in clusters:
-                            discipline_key = _normalize_discipline(
-                                cluster["discipline"]
+                            week_counts = lesson_counts_by_teacher.setdefault(
+                                cluster["teacher_identity"],
+                                Counter(),
                             )
-                            if discipline_key:
-                                disciplines_by_teacher.setdefault(
-                                    cluster["teacher_identity"],
-                                    set(),
-                                ).add(discipline_key)
+                            week_counts.update(cluster["weeks"])
                         conflicting_teachers = {
                             teacher_identity
-                            for teacher_identity, disciplines in (
-                                disciplines_by_teacher.items()
+                            for teacher_identity, week_counts in (
+                                lesson_counts_by_teacher.items()
                             )
-                            if len(disciplines) > 1
+                            if max(week_counts.values(), default=0) > 1
                         }
                         has_overlap = bool(conflicting_teachers)
                         has_suggestion = any(
@@ -1812,7 +2513,9 @@ def build_schedule_xlsx(
                         )
                         for offset, value in enumerate(values):
                             data_cell = worksheet.cell(
-                                row, start_column + offset, value
+                                row,
+                                start_column + offset,
+                                _excel_safe_text(value, multiline=True),
                             )
                             data_cell.alignment = Alignment(
                                 horizontal="left" if offset == 0 else "center",
@@ -1845,8 +2548,8 @@ def build_schedule_xlsx(
 
                     if maximum_lines:
                         worksheet.row_dimensions[row].height = min(
-                            100,
-                            38 + (maximum_lines - 1) * 22,
+                            400,
+                            38 + (maximum_lines - 1) * 24,
                         )
                     else:
                         worksheet.row_dimensions[row].height = 24
@@ -1903,6 +2606,9 @@ def build_schedule_xlsx(
 
         worksheet.print_area = f"A1:{get_column_letter(total_columns)}{total_rows}"
 
+        if room_conflicts is not None:
+            _append_room_conflicts_sheet(workbook, room_conflicts)
+
         output = BytesIO()
         workbook.save(output)
         return output.getvalue()
@@ -1937,13 +2643,18 @@ def _render_workload_audit(
         st.info("В нагрузке не найдены назначения выбранных преподавателей.")
         return
 
-    summary_columns = st.columns(4)
+    summary_columns = st.columns(5)
     summary_columns[0].metric("Назначений", audit.checked_assignments)
     summary_columns[1].metric("Совпало", audit.matched_assignments)
     summary_columns[2].metric("Ошибок", len(audit.errors.index))
     summary_columns[3].metric("Возможных мест", len(audit.suggestions.index))
+    summary_columns[4].metric("Накладок", len(audit.potential_conflicts.index))
 
-    if audit.errors.empty and audit.suggestions.empty:
+    if (
+        audit.errors.empty
+        and audit.suggestions.empty
+        and audit.potential_conflicts.empty
+    ):
         st.success("Нагрузка соответствует загруженному расписанию.")
         return
     if not audit.errors.empty:
@@ -1954,49 +2665,56 @@ def _render_workload_audit(
             st.caption("Показаны замечания только по введённым преподавателям.")
             st.dataframe(
                 audit.errors,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 row_height=54,
             )
     if not audit.suggestions.empty:
-        conflict_mask = audit.suggestions["Возможная накладка"].map(
-            lambda value: bool(clean_cell(value))
-        )
-        possible_conflicts = audit.suggestions[conflict_mask]
-        other_suggestions = audit.suggestions[~conflict_mask]
-        if not other_suggestions.empty:
-            with st.expander(
-                f"⚠ Возможные места и подстановки ({len(other_suggestions.index)})",
-                expanded=False,
-            ):
-                st.caption(
-                    "Однозначная подстановка попадает в XLSX; неоднозначная "
-                    "остаётся только подсказкой на сайте."
-                )
-                st.dataframe(
-                    other_suggestions,
-                    use_container_width=True,
-                    hide_index=True,
-                    row_height=70,
-                )
-        if not possible_conflicts.empty:
-            with st.expander(
-                f"🔴 Возможные накладки после подстановки "
-                f"({len(possible_conflicts.index)})",
-                expanded=False,
-            ):
-                st.dataframe(
-                    possible_conflicts,
-                    use_container_width=True,
-                    hide_index=True,
-                    row_height=70,
-                )
+        with st.expander(
+            f"⚠ Возможные места и подстановки ({len(audit.suggestions.index)})",
+            expanded=False,
+        ):
+            st.caption(
+                "Однозначная подстановка попадает в XLSX; неоднозначная "
+                "остаётся только подсказкой на сайте."
+            )
+            st.dataframe(
+                audit.suggestions,
+                width="stretch",
+                hide_index=True,
+                row_height=70,
+            )
 
         exported_count = len(audit.suggested_records.index)
         if exported_count:
             st.warning(
                 f"В сводное расписание добавлено однозначно восстановленных "
                 f"строк: {exported_count}. Они отмечены знаком ⚠ и цветом."
+            )
+
+    if not audit.potential_conflicts.empty:
+        maximum_lessons = max(
+            (
+                len(_clean_multiline_cell(value).splitlines())
+                for value in audit.potential_conflicts["Дисциплина"]
+            ),
+            default=1,
+        )
+        with st.expander(
+            f"🔴 Возможные накладки по расписанию и нагрузке "
+            f"({len(audit.potential_conflicts.index)})",
+            expanded=False,
+        ):
+            st.caption(
+                "Здесь учитываются все возможные места выбранного преподавателя. "
+                "Неоднозначные варианты показаны только для проверки и не "
+                "добавляются в XLSX."
+            )
+            st.dataframe(
+                audit.potential_conflicts.reindex(columns=DISPLAY_COLUMNS),
+                width="stretch",
+                hide_index=True,
+                row_height=min(400, max(70, 30 + maximum_lessons * 24)),
             )
 
 
@@ -2016,8 +2734,9 @@ def _render_footer(st: Any) -> None:
 4. Нажмите **Найти расписание**.
 5. Раскрывайте только нужные разделы: расписание, ошибки нагрузки, возможные подстановки или накладки.
 6. Жёлтый значок **⚠** означает, что ФИО однозначно восстановлено по нагрузке. Только такие подстановки добавляются в XLSX; неоднозначные варианты остаются на сайте.
-7. Красным цветом отмечаются разные дисциплины одного преподавателя в одно время.
-8. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную Excel-таблицу.
+7. Красным цветом отмечаются два и более занятия преподавателя в одно время и на пересекающихся учебных неделях. Практики разных групп считаются отдельно, а общая лекция нескольких групп остаётся одним занятием.
+8. Блок **Накладки аудиторий** показывает, если один кабинет одновременно занят разными занятиями. Общая лекция одного предмета для нескольких групп исключается из предупреждений.
+9. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную сетку и отдельный лист с найденными накладками аудиторий.
 
 **Как это работает:** приложение написано на Python и Streamlit. Pandas читает загруженные Excel-файлы, очищает объединённые и «грязные» ячейки, после чего поиск собирает занятия выбранных преподавателей из всех курсов.
                 """
@@ -2159,6 +2878,14 @@ def _render_app(st: Any) -> None:
         workload_audit,
         teacher_queries,
     )
+    room_schedule_records = merge_all_schedule_suggestions(
+        batch_result.all_records,
+        workload_audit,
+    )
+    room_conflicts = find_room_conflicts(
+        room_schedule_records,
+        teacher_queries,
+    )
     if result_df.empty:
         st.warning("Занятия указанных преподавателей не найдены.")
         return
@@ -2180,6 +2907,17 @@ def _render_app(st: Any) -> None:
 
     display_df = collapse_schedule_conflicts(result_df)
     conflict_count = int(display_df[CONFLICT_COLUMN].astype(bool).sum())
+    maximum_lessons_per_slot = max(
+        (
+            len(_clean_multiline_cell(value).splitlines())
+            for value in display_df["Дисциплина"]
+        ),
+        default=1,
+    )
+    schedule_row_height = min(
+        400,
+        max(54, 30 + maximum_lessons_per_slot * 24),
+    )
     if conflict_count:
         st.warning(
             f"Обнаружено накладок: {conflict_count}. Разные занятия одного "
@@ -2192,9 +2930,9 @@ def _render_app(st: Any) -> None:
     ):
         st.dataframe(
             display_df.reindex(columns=DISPLAY_COLUMNS),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
-            row_height=54 if conflict_count else None,
+            row_height=schedule_row_height,
         )
 
     if conflict_count:
@@ -2206,13 +2944,47 @@ def _render_app(st: Any) -> None:
                 display_df[display_df[CONFLICT_COLUMN].astype(bool)].reindex(
                     columns=DISPLAY_COLUMNS
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
-                row_height=70,
+                row_height=schedule_row_height,
+            )
+
+    if room_conflicts.empty:
+        st.success("Накладок аудиторий для выбранных преподавателей не найдено.")
+    else:
+        maximum_room_lessons = max(
+            (
+                len(_clean_multiline_cell(value).splitlines())
+                for value in room_conflicts["Дисциплины"]
+            ),
+            default=2,
+        )
+        st.warning(
+            f"Обнаружено накладок аудиторий: {len(room_conflicts.index)}. "
+            "Проверка учитывает все загруженные расписания."
+        )
+        with st.expander(
+            f"🏫 Накладки аудиторий ({len(room_conflicts.index)})",
+            expanded=False,
+        ):
+            st.caption(
+                "Показаны только конфликты, затрагивающие введённых "
+                "преподавателей. Общая лекция одного предмета для нескольких "
+                "групп не считается ошибкой."
+            )
+            st.dataframe(
+                room_conflicts.reindex(columns=ROOM_CONFLICT_COLUMNS),
+                width="stretch",
+                hide_index=True,
+                row_height=min(400, max(70, 30 + maximum_room_lessons * 24)),
             )
 
     try:
-        export_bytes = build_schedule_xlsx(result_df, teacher_queries)
+        export_bytes = build_schedule_xlsx(
+            result_df,
+            teacher_queries,
+            room_conflicts,
+        )
     except ScheduleError as exc:
         st.error(str(exc))
         return
