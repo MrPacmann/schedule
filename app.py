@@ -234,10 +234,7 @@ def _format_time(value: Any) -> str:
     text_value = clean_cell(value)
     time_match = TIME_TEXT_PATTERN.fullmatch(text_value)
     if time_match is not None and time_match.group("seconds") in (None, "00"):
-        return (
-            f"{int(time_match.group('hours')):02d}:"
-            f"{time_match.group('minutes')}"
-        )
+        return f"{int(time_match.group('hours')):02d}:{time_match.group('minutes')}"
 
     return text_value
 
@@ -359,7 +356,9 @@ def _prepare_schedule_rows(df: pd.DataFrame, group_row_idx: int) -> pd.DataFrame
 
     data_start_idx = group_row_idx + 2
     if data_start_idx >= len(df.index):
-        raise ScheduleFormatError("После строки с группами не найдены строки расписания.")
+        raise ScheduleFormatError(
+            "После строки с группами не найдены строки расписания."
+        )
 
     schedule_rows = df.iloc[data_start_idx:].copy()
     with pd.option_context("future.no_silent_downcasting", True):
@@ -505,8 +504,24 @@ def _lesson_count_text(count: int) -> str:
     return f"{count} {noun}"
 
 
+def _group_count_text(count: int) -> str:
+    """Возвращает согласованную русскую подпись количества групп."""
+
+    last_two_digits = count % 100
+    last_digit = count % 10
+    if 11 <= last_two_digits <= 14:
+        noun = "групп"
+    elif last_digit == 1:
+        noun = "группа"
+    elif 2 <= last_digit <= 4:
+        noun = "группы"
+    else:
+        noun = "групп"
+    return f"{count} {noun}"
+
+
 def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
-    """Сворачивает реальные накладки в одну строку с параллельными значениями."""
+    """Сворачивает повторные назначения одного слота в одну строку."""
 
     if records.empty:
         return pd.DataFrame(columns=DISPLAY_COLUMNS)
@@ -558,7 +573,8 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
             if source and source not in lesson["sources"]:
                 lesson["sources"].append(source)
 
-        if len(logical_lessons) <= 1:
+        assignment_count = len(slot_records.index)
+        if assignment_count <= 1:
             for record in slot_records.to_dict(orient="records"):
                 display_record = {
                     column: clean_cell(record.get(column, ""))
@@ -570,6 +586,15 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
 
         lessons = list(logical_lessons.values())
         first_record = slot_records.iloc[0]
+        if len(lessons) > 1:
+            conflict_text = f"⚠ {_lesson_count_text(len(lessons))} одновременно"
+        else:
+            distinct_group_count = len(lessons[0]["groups"])
+            conflict_text = (
+                "⚠ "
+                f"{_group_count_text(distinct_group_count or assignment_count)} "
+                "одновременно"
+            )
         display_records.append(
             {
                 QUERY_COLUMN: clean_cell(first_record[QUERY_COLUMN]),
@@ -578,19 +603,13 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
                 "Пара": clean_cell(first_record["Пара"]),
                 "Время": "\n".join(lesson["time"] for lesson in lessons),
                 "Неделя": clean_cell(first_record["Неделя"]),
-                CONFLICT_COLUMN: f"⚠ {_lesson_count_text(len(lessons))} одновременно",
+                CONFLICT_COLUMN: conflict_text,
                 "Группа": "\n".join(
                     _join_unique(lesson["groups"]) for lesson in lessons
                 ),
-                "Дисциплина": "\n".join(
-                    lesson["discipline"] for lesson in lessons
-                ),
-                "Вид занятий": "\n".join(
-                    lesson["lesson_type"] for lesson in lessons
-                ),
-                "Аудитория": "\n".join(
-                    lesson["auditorium"] for lesson in lessons
-                ),
+                "Дисциплина": "\n".join(lesson["discipline"] for lesson in lessons),
+                "Вид занятий": "\n".join(lesson["lesson_type"] for lesson in lessons),
+                "Аудитория": "\n".join(lesson["auditorium"] for lesson in lessons),
                 SOURCE_COLUMN: "\n".join(
                     _join_unique(lesson["sources"]) for lesson in lessons
                 ),
@@ -618,17 +637,13 @@ def parse_schedule_multi(
     if not queries:
         raise ValueError("Введите хотя бы одну фамилию преподавателя.")
 
-    normalized_queries = [
-        (query, _normalize_search_text(query)) for query in queries
-    ]
+    normalized_queries = [(query, _normalize_search_text(query)) for query in queries]
 
     group_row_idx = find_group_row(df)
     schedule_rows = _prepare_schedule_rows(df, group_row_idx)
 
     if df.shape[1] <= FIRST_GROUP_COLUMN + 2:
-        raise ScheduleFormatError(
-            "В файле не найдены столбцы групп и преподавателей."
-        )
+        raise ScheduleFormatError("В файле не найдены столбцы групп и преподавателей.")
 
     records: list[dict[str, str]] = []
     group_columns = range(
@@ -949,13 +964,14 @@ def build_schedule_xlsx(
         teacher_fill = PatternFill("solid", fgColor="75FB4C")
         white_fill = PatternFill("solid", fgColor="FFFFFF")
 
-        teacher_starts = {4 + teacher_index * 4 for teacher_index in range(len(queries))}
+        teacher_starts = {
+            4 + teacher_index * 4 for teacher_index in range(len(queries))
+        }
         teacher_ends = {7 + teacher_index * 4 for teacher_index in range(len(queries))}
         medium_left_columns = {1, *teacher_starts}
         medium_right_columns = {3, *teacher_ends, total_columns}
         day_start_rows = {
-            3 + day_index * rows_per_day
-            for day_index in range(len(DAY_EXPORT_CONFIG))
+            3 + day_index * rows_per_day for day_index in range(len(DAY_EXPORT_CONFIG))
         }
         day_end_rows = {
             2 + (day_index + 1) * rows_per_day
@@ -978,11 +994,7 @@ def build_schedule_xlsx(
             return Border(
                 left=medium_black if column in medium_left_columns else thin_gray,
                 right=medium_black if column in medium_right_columns else thin_gray,
-                top=(
-                    medium_black
-                    if row == 1 or row in day_start_rows
-                    else thin_gray
-                ),
+                top=(medium_black if row == 1 or row in day_start_rows else thin_gray),
                 bottom=(
                     medium_black
                     if row == 2 or row in day_end_rows or row == total_rows
@@ -1094,11 +1106,13 @@ def build_schedule_xlsx(
                             ),
                             [],
                         )
+                        assignment_count = sum(
+                            max(1, len(cluster["groups"])) for cluster in clusters
+                        )
+                        has_overlap = assignment_count > 1
                         maximum_lines = max(maximum_lines, len(clusters))
-                        disciplines = [
-                            cluster["discipline"] for cluster in clusters
-                        ]
-                        if len(disciplines) > 1:
+                        disciplines = [cluster["discipline"] for cluster in clusters]
+                        if has_overlap and disciplines:
                             disciplines[0] = f"⚠ {disciplines[0]}"
                         values = (
                             "\n".join(disciplines),
@@ -1109,7 +1123,9 @@ def build_schedule_xlsx(
                             "\n".join(cluster["auditorium"] for cluster in clusters),
                         )
                         for offset, value in enumerate(values):
-                            data_cell = worksheet.cell(row, start_column + offset, value)
+                            data_cell = worksheet.cell(
+                                row, start_column + offset, value
+                            )
                             data_cell.alignment = Alignment(
                                 horizontal="left" if offset == 0 else "center",
                                 vertical="center",
@@ -1118,9 +1134,9 @@ def build_schedule_xlsx(
                             data_cell.border = cell_border(
                                 row,
                                 start_column + offset,
-                                conflict=len(clusters) > 1,
+                                conflict=has_overlap,
                             )
-                            if len(clusters) > 1 and offset == 0:
+                            if has_overlap and offset == 0:
                                 data_cell.font = Font(
                                     name="Arial",
                                     size=10,
@@ -1213,7 +1229,7 @@ def _render_footer(st: Any) -> None:
 1. Нажмите **Browse files** и выберите один или несколько файлов `.xls`/`.xlsx`.
 2. Введите фамилии преподавателей — каждую с новой строки либо через запятую.
 3. Нажмите **Найти расписание**.
-4. Проверьте найденные занятия в таблице. Значок **⚠** означает накладку: несколько разных занятий идут одновременно.
+4. Проверьте найденные занятия в таблице. Значок **⚠** означает накладку: преподаватель одновременно назначен на несколько групп или занятий.
 5. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную Excel-таблицу.
 
 **Как это работает:** приложение написано на Python и Streamlit. Pandas читает загруженные Excel-файлы, очищает объединённые и «грязные» ячейки, после чего поиск собирает занятия выбранных преподавателей из всех курсов.
@@ -1285,9 +1301,7 @@ def _render_app(st: Any) -> None:
             return
 
     if batch_result.errors:
-        st.warning(
-            "Некоторые файлы не обработаны. Остальные результаты сохранены."
-        )
+        st.warning("Некоторые файлы не обработаны. Остальные результаты сохранены.")
         with st.expander("Ошибки файлов"):
             for file_error in batch_result.errors:
                 st.write(f"• {file_error.filename}: {file_error.message}")
@@ -1324,8 +1338,8 @@ def _render_app(st: Any) -> None:
     conflict_count = int(display_df[CONFLICT_COLUMN].astype(bool).sum())
     if conflict_count:
         st.warning(
-            f"Обнаружено накладок: {conflict_count}. Разные занятия одного "
-            "временного слота показаны вместе в одной строке."
+            f"Обнаружено накладок: {conflict_count}. Повторные назначения "
+            "одного временного слота показаны вместе в одной строке."
         )
 
     st.dataframe(
@@ -1345,10 +1359,7 @@ def _render_app(st: Any) -> None:
         "Скачать сводное расписание XLSX",
         data=export_bytes,
         file_name="расписание_преподавателей.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+        mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         type="primary",
     )
 
