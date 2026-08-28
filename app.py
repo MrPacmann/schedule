@@ -40,6 +40,7 @@ MAX_CACHED_FILES: Final[int] = 20
 QUERY_COLUMN: Final[str] = "Искомый преподаватель"
 TEACHER_COLUMN: Final[str] = "Преподаватель"
 SOURCE_COLUMN: Final[str] = "Файл-источник"
+CONFLICT_COLUMN: Final[str] = "Накладка"
 
 OUTPUT_COLUMNS: Final[list[str]] = [
     "День недели",
@@ -62,7 +63,15 @@ INTERNAL_COLUMNS: Final[list[str]] = [
 DISPLAY_COLUMNS: Final[list[str]] = [
     QUERY_COLUMN,
     TEACHER_COLUMN,
-    *OUTPUT_COLUMNS,
+    "День недели",
+    "Пара",
+    "Время",
+    "Неделя",
+    CONFLICT_COLUMN,
+    "Группа",
+    "Дисциплина",
+    "Вид занятий",
+    "Аудитория",
     SOURCE_COLUMN,
 ]
 
@@ -467,6 +476,135 @@ def sort_internal_schedule(
             "__source_order",
         ]
     ).reset_index(drop=True)
+
+
+def _join_unique(values: Sequence[Any], separator: str = ", ") -> str:
+    """Объединяет непустые значения без дублей, сохраняя исходный порядок."""
+
+    unique_values: list[str] = []
+    for value in values:
+        cleaned_value = clean_cell(value)
+        if cleaned_value and cleaned_value not in unique_values:
+            unique_values.append(cleaned_value)
+    return separator.join(unique_values)
+
+
+def _lesson_count_text(count: int) -> str:
+    """Возвращает согласованную русскую подпись количества занятий."""
+
+    last_two_digits = count % 100
+    last_digit = count % 10
+    if 11 <= last_two_digits <= 14:
+        noun = "занятий"
+    elif last_digit == 1:
+        noun = "занятие"
+    elif 2 <= last_digit <= 4:
+        noun = "занятия"
+    else:
+        noun = "занятий"
+    return f"{count} {noun}"
+
+
+def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
+    """Сворачивает реальные накладки в одну строку с параллельными значениями."""
+
+    if records.empty:
+        return pd.DataFrame(columns=DISPLAY_COLUMNS)
+
+    required_columns = set(INTERNAL_COLUMNS)
+    if missing_columns := required_columns.difference(records.columns):
+        raise ValueError(
+            "Для поиска накладок не хватает столбцов: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    display_records: list[dict[str, str]] = []
+    slot_columns = [
+        QUERY_COLUMN,
+        TEACHER_COLUMN,
+        "День недели",
+        "Пара",
+        "Неделя",
+    ]
+
+    for _, slot_records in records.groupby(
+        slot_columns,
+        sort=False,
+        dropna=False,
+    ):
+        logical_lessons: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        for record in slot_records.to_dict(orient="records"):
+            lesson_key = (
+                clean_cell(record["Время"]),
+                clean_cell(record["Дисциплина"]),
+                clean_cell(record["Вид занятий"]),
+                clean_cell(record["Аудитория"]),
+            )
+            lesson = logical_lessons.setdefault(
+                lesson_key,
+                {
+                    "time": lesson_key[0],
+                    "discipline": lesson_key[1],
+                    "lesson_type": lesson_key[2],
+                    "auditorium": lesson_key[3],
+                    "groups": [],
+                    "sources": [],
+                },
+            )
+            group = clean_cell(record["Группа"])
+            source = clean_cell(record[SOURCE_COLUMN])
+            if group and group not in lesson["groups"]:
+                lesson["groups"].append(group)
+            if source and source not in lesson["sources"]:
+                lesson["sources"].append(source)
+
+        if len(logical_lessons) <= 1:
+            for record in slot_records.to_dict(orient="records"):
+                display_record = {
+                    column: clean_cell(record.get(column, ""))
+                    for column in INTERNAL_COLUMNS
+                }
+                display_record[CONFLICT_COLUMN] = ""
+                display_records.append(display_record)
+            continue
+
+        lessons = list(logical_lessons.values())
+        first_record = slot_records.iloc[0]
+        display_records.append(
+            {
+                QUERY_COLUMN: clean_cell(first_record[QUERY_COLUMN]),
+                TEACHER_COLUMN: clean_cell(first_record[TEACHER_COLUMN]),
+                "День недели": clean_cell(first_record["День недели"]),
+                "Пара": clean_cell(first_record["Пара"]),
+                "Время": "\n".join(lesson["time"] for lesson in lessons),
+                "Неделя": clean_cell(first_record["Неделя"]),
+                CONFLICT_COLUMN: f"⚠ {_lesson_count_text(len(lessons))} одновременно",
+                "Группа": "\n".join(
+                    _join_unique(lesson["groups"]) for lesson in lessons
+                ),
+                "Дисциплина": "\n".join(
+                    lesson["discipline"] for lesson in lessons
+                ),
+                "Вид занятий": "\n".join(
+                    lesson["lesson_type"] for lesson in lessons
+                ),
+                "Аудитория": "\n".join(
+                    lesson["auditorium"] for lesson in lessons
+                ),
+                SOURCE_COLUMN: "\n".join(
+                    _join_unique(lesson["sources"]) for lesson in lessons
+                ),
+            }
+        )
+
+    display_frame = pd.DataFrame.from_records(
+        display_records,
+        columns=DISPLAY_COLUMNS,
+    )
+    return sort_internal_schedule(
+        display_frame,
+        parse_teacher_queries(records[QUERY_COLUMN].tolist()),
+    )
 
 
 def parse_schedule_multi(
@@ -957,8 +1095,13 @@ def build_schedule_xlsx(
                             [],
                         )
                         maximum_lines = max(maximum_lines, len(clusters))
+                        disciplines = [
+                            cluster["discipline"] for cluster in clusters
+                        ]
+                        if len(disciplines) > 1:
+                            disciplines[0] = f"⚠ {disciplines[0]}"
                         values = (
-                            "\n".join(cluster["discipline"] for cluster in clusters),
+                            "\n".join(disciplines),
                             "\n".join(cluster["lesson_type"] for cluster in clusters),
                             "\n".join(
                                 ", ".join(cluster["groups"]) for cluster in clusters
@@ -977,6 +1120,13 @@ def build_schedule_xlsx(
                                 start_column + offset,
                                 conflict=len(clusters) > 1,
                             )
+                            if len(clusters) > 1 and offset == 0:
+                                data_cell.font = Font(
+                                    name="Arial",
+                                    size=10,
+                                    bold=True,
+                                    color="C00000",
+                                )
 
                     if maximum_lines:
                         worksheet.row_dimensions[row].height = min(
@@ -1050,21 +1200,32 @@ def build_schedule_xlsx(
         ) from exc
 
 
-def main() -> None:
-    """Запускает пользовательский интерфейс Streamlit."""
+def _render_footer(st: Any) -> None:
+    """Показывает постоянный нижний блок со справкой и авторством."""
 
-    try:
-        import streamlit as st
-    except ModuleNotFoundError as exc:  # pragma: no cover - подсказка для CLI-запуска
-        raise RuntimeError(
-            "Streamlit не установлен. Выполните 'pip install -r requirements.txt', "
-            "затем запустите 'streamlit run app.py'."
-        ) from exc
+    st.divider()
+    help_column, author_column = st.columns([1, 8])
+    with help_column:
+        with st.popover("❓ Справка"):
+            st.markdown("### Как пользоваться")
+            st.markdown(
+                """
+1. Нажмите **Browse files** и выберите один или несколько файлов `.xls`/`.xlsx`.
+2. Введите фамилии преподавателей — каждую с новой строки либо через запятую.
+3. Нажмите **Найти расписание**.
+4. Проверьте найденные занятия в таблице. Значок **⚠** означает накладку: несколько разных занятий идут одновременно.
+5. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную Excel-таблицу.
 
-    st.set_page_config(
-        page_title="Поиск расписания преподавателя",
-        layout="wide",
-    )
+**Как это работает:** приложение написано на Python и Streamlit. Pandas читает загруженные Excel-файлы, очищает объединённые и «грязные» ячейки, после чего поиск собирает занятия выбранных преподавателей из всех курсов.
+                """
+            )
+    with author_column:
+        st.caption("Автор: Трушин С.")
+
+
+def _render_app(st: Any) -> None:
+    """Отрисовывает основную часть пользовательского интерфейса."""
+
     st.title("Расписание преподавателя")
     st.caption(
         "Загрузите расписания нескольких курсов, укажите нужных преподавателей "
@@ -1159,10 +1320,19 @@ def main() -> None:
     if missing_queries:
         st.info("Без совпадений: " + ", ".join(missing_queries))
 
+    display_df = collapse_schedule_conflicts(result_df)
+    conflict_count = int(display_df[CONFLICT_COLUMN].astype(bool).sum())
+    if conflict_count:
+        st.warning(
+            f"Обнаружено накладок: {conflict_count}. Разные занятия одного "
+            "временного слота показаны вместе в одной строке."
+        )
+
     st.dataframe(
-        result_df.reindex(columns=DISPLAY_COLUMNS),
+        display_df.reindex(columns=DISPLAY_COLUMNS),
         use_container_width=True,
         hide_index=True,
+        row_height=54 if conflict_count else None,
     )
 
     try:
@@ -1181,6 +1351,27 @@ def main() -> None:
         ),
         type="primary",
     )
+
+
+def main() -> None:
+    """Запускает постоянно доступный пользовательский интерфейс Streamlit."""
+
+    try:
+        import streamlit as st
+    except ModuleNotFoundError as exc:  # pragma: no cover - подсказка для CLI-запуска
+        raise RuntimeError(
+            "Streamlit не установлен. Выполните 'pip install -r requirements.txt', "
+            "затем запустите 'streamlit run app.py'."
+        ) from exc
+
+    st.set_page_config(
+        page_title="Поиск расписания преподавателя",
+        layout="wide",
+    )
+    try:
+        _render_app(st)
+    finally:
+        _render_footer(st)
 
 
 if __name__ == "__main__":
