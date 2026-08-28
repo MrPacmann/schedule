@@ -50,8 +50,16 @@ GROUP_BLOCK_SIZE: Final[int] = 5
 SESSION_CACHE_KEY: Final[str] = "_schedule_excel_cache"
 PARSED_SCHEDULE_CACHE_KEY: Final[str] = "_parsed_schedule_cache"
 MAX_CACHED_FILES: Final[int] = 20
-APP_VERSION: Final[str] = "1.8.2"
+APP_VERSION: Final[str] = "1.8.3"
 APP_CHANGELOG: Final[tuple[tuple[str, str, tuple[str, ...]], ...]] = (
+    (
+        "1.8.3",
+        "29.08.2026",
+        (
+            "Переданные другому преподавателю занятия помечаются в расписании сайта и XLSX.",
+            "Колонка статуса переименована в «Проверка нагрузки».",
+        ),
+    ),
     (
         "1.8.2",
         "29.08.2026",
@@ -155,7 +163,7 @@ QUERY_COLUMN: Final[str] = "Искомый преподаватель"
 TEACHER_COLUMN: Final[str] = "Преподаватель"
 SOURCE_COLUMN: Final[str] = "Файл-источник"
 CONFLICT_COLUMN: Final[str] = "Накладка"
-SUGGESTED_COLUMN: Final[str] = "Подстановка из нагрузки"
+SUGGESTED_COLUMN: Final[str] = "Проверка нагрузки"
 ROOM_CONFLICT_COLUMN: Final[str] = "Накладка аудитории"
 WORKLOAD_CLASS_TYPES: Final[frozenset[str]] = frozenset({"ЛК", "ПР"})
 REMOTE_ROOM_MARKERS: Final[tuple[str, ...]] = (
@@ -342,6 +350,7 @@ class WorkloadAuditResult:
     errors: pd.DataFrame
     suggestions: pd.DataFrame
     suggested_records: pd.DataFrame
+    transferred_records: pd.DataFrame
     potential_conflicts: pd.DataFrame
 
 
@@ -1675,7 +1684,7 @@ def _find_transferred_workload_issues(
     workload: pd.DataFrame,
     schedule: pd.DataFrame,
     normalized_queries: Sequence[tuple[str, str]],
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Находит занятия, оставшиеся в расписании после передачи нагрузки."""
 
     assignment_columns = [
@@ -1702,6 +1711,7 @@ def _find_transferred_workload_issues(
     ]
 
     issues: list[dict[str, str]] = []
+    transferred_records: list[dict[str, str]] = []
     schedule_columns = [*assignment_columns, TEACHER_COLUMN]
     for key, candidates in selected_schedule.groupby(
         schedule_columns,
@@ -1737,6 +1747,32 @@ def _find_transferred_workload_issues(
         if scheduled_tokens.intersection(expected_surnames):
             continue
 
+        expected_teacher_text = ", ".join(expected_teachers)
+        transfer_label = f"❌ По нагрузке передано: {expected_teacher_text}"
+        matching_queries = [
+            query
+            for query, normalized_query in normalized_queries
+            if normalized_query in _normalize_search_text(scheduled_teacher)
+        ]
+        for candidate in candidates.to_dict(orient="records"):
+            for query in matching_queries:
+                transferred_records.append(
+                    {
+                        QUERY_COLUMN: query,
+                        TEACHER_COLUMN: scheduled_teacher,
+                        SUGGESTED_COLUMN: transfer_label,
+                        "День недели": clean_cell(candidate["День недели"]),
+                        "Пара": clean_cell(candidate["Пара"]),
+                        "Время": clean_cell(candidate["Время"]),
+                        "Неделя": clean_cell(candidate["Неделя"]),
+                        "Группа": clean_cell(candidate["Группа"]),
+                        "Дисциплина": clean_cell(candidate["Дисциплина"]),
+                        "Вид занятий": clean_cell(candidate["Вид занятий"]),
+                        "Аудитория": clean_cell(candidate["Аудитория"]),
+                        SOURCE_COLUMN: clean_cell(candidate[SOURCE_COLUMN]),
+                    }
+                )
+
         # Если в одном поиске указаны обе стороны передачи, исходная проверка
         # нагрузки уже показывает это расхождение — второй дубль не нужен.
         if any(
@@ -1757,7 +1793,7 @@ def _find_transferred_workload_issues(
                     "Занятие осталось в расписании, но по нагрузке "
                     "передано другому преподавателю"
                 ),
-                "Преподаватели по нагрузке": ", ".join(expected_teachers),
+                "Преподаватели по нагрузке": expected_teacher_text,
                 "Дисциплина": clean_cell(first["Дисциплина"]),
                 "Вид занятий": lesson_type,
                 "Группа": group,
@@ -1768,7 +1804,7 @@ def _find_transferred_workload_issues(
                 "Возможное место в расписании": _schedule_place(candidates),
             }
         )
-    return issues
+    return issues, transferred_records
 
 
 def audit_workload(
@@ -2061,10 +2097,12 @@ def audit_workload(
             }
         )
 
-    transferred_issues = _find_transferred_workload_issues(
-        prepared_workload,
-        schedule,
-        normalized_queries,
+    transferred_issues, transferred_schedule_records = (
+        _find_transferred_workload_issues(
+            prepared_workload,
+            schedule,
+            normalized_queries,
+        )
     )
     error_records.extend(transferred_issues)
     checked_assignments += len(transferred_issues)
@@ -2081,6 +2119,15 @@ def audit_workload(
     if not suggested_records.empty:
         suggested_records = _deduplicate_batch_records(
             suggested_records,
+            queries,
+        )
+    transferred_records = pd.DataFrame.from_records(
+        transferred_schedule_records,
+        columns=INTERNAL_COLUMNS,
+    )
+    if not transferred_records.empty:
+        transferred_records = _deduplicate_batch_records(
+            transferred_records,
             queries,
         )
 
@@ -2116,6 +2163,7 @@ def audit_workload(
         errors=errors,
         suggestions=suggestions,
         suggested_records=suggested_records,
+        transferred_records=transferred_records,
         potential_conflicts=potential_conflicts,
     )
 
@@ -2125,12 +2173,13 @@ def merge_workload_suggestions(
     audit: WorkloadAuditResult | None,
     teacher_queries: Sequence[str],
 ) -> pd.DataFrame:
-    """Добавляет к выдаче только однозначные подстановки из нагрузки."""
+    """Добавляет к выдаче подстановки и отметки передачи нагрузки."""
 
-    if audit is None or audit.suggested_records.empty:
+    if audit is None:
         return schedule_records.reindex(columns=INTERNAL_COLUMNS)
     combined = pd.concat(
         [
+            audit.transferred_records.reindex(columns=INTERNAL_COLUMNS),
             schedule_records.reindex(columns=INTERNAL_COLUMNS),
             audit.suggested_records.reindex(columns=INTERNAL_COLUMNS),
         ],
@@ -2266,6 +2315,7 @@ def _export_clusters_for_query(
                 "teacher_identity": key[3],
                 "teacher": clean_cell(record[TEACHER_COLUMN]),
                 "suggested": False,
+                "workload_error": False,
                 "time": clean_cell(record["Время"]),
                 "discipline": discipline,
                 "lesson_type": lesson_type,
@@ -2275,8 +2325,11 @@ def _export_clusters_for_query(
             },
         )
         cluster["weeks"].update(_extract_lesson_weeks(discipline, record["Неделя"]))
-        cluster["suggested"] = cluster["suggested"] or bool(
-            clean_cell(record.get(SUGGESTED_COLUMN, ""))
+        workload_status = clean_cell(record.get(SUGGESTED_COLUMN, ""))
+        is_workload_error = workload_status.startswith("❌")
+        cluster["workload_error"] = cluster["workload_error"] or is_workload_error
+        cluster["suggested"] = cluster["suggested"] or (
+            bool(workload_status) and not is_workload_error
         )
         if group and group not in cluster["groups"]:
             cluster["groups"].append(group)
@@ -2611,6 +2664,9 @@ def build_schedule_xlsx(
                             if max(week_counts.values(), default=0) > 1
                         }
                         has_overlap = bool(conflicting_teachers)
+                        has_workload_error = any(
+                            cluster["workload_error"] for cluster in clusters
+                        )
                         has_suggestion = any(
                             cluster["suggested"] for cluster in clusters
                         )
@@ -2624,6 +2680,15 @@ def build_schedule_xlsx(
                             )
                             disciplines[warning_index] = (
                                 f"⚠ {disciplines[warning_index]}"
+                            )
+                        elif has_workload_error and disciplines:
+                            warning_index = next(
+                                index
+                                for index, cluster in enumerate(clusters)
+                                if cluster["workload_error"]
+                            )
+                            disciplines[warning_index] = (
+                                f"❌ {disciplines[warning_index]}"
                             )
                         elif has_suggestion and disciplines:
                             warning_index = next(
@@ -2656,13 +2721,13 @@ def build_schedule_xlsx(
                             data_cell.border = cell_border(
                                 row,
                                 start_column + offset,
-                                conflict=has_overlap,
+                                conflict=has_overlap or has_workload_error,
                             )
-                            if has_overlap:
+                            if has_overlap or has_workload_error:
                                 data_cell.fill = conflict_fill
                             elif has_suggestion:
                                 data_cell.fill = suggested_fill
-                            if has_overlap and offset == 0:
+                            if (has_overlap or has_workload_error) and offset == 0:
                                 data_cell.font = Font(
                                     name="Arial",
                                     size=10,
@@ -2849,6 +2914,23 @@ def _render_workload_audit(
             )
 
 
+def _style_schedule_table(frame: pd.DataFrame) -> Any:
+    """Выделяет накладки и замечания нагрузки в расписании сайта."""
+
+    def row_style(row: pd.Series) -> list[str]:
+        workload_status = clean_cell(row.get(SUGGESTED_COLUMN, ""))
+        conflict_status = clean_cell(row.get(CONFLICT_COLUMN, ""))
+        if conflict_status or workload_status.startswith("❌"):
+            css = "background-color: #FCE8E6; color: #9C0006;"
+        elif workload_status:
+            css = "background-color: #FFF4CE; color: #7A5200;"
+        else:
+            css = ""
+        return [css] * len(row.index)
+
+    return frame.style.apply(row_style, axis=1)
+
+
 def _render_footer(st: Any) -> None:
     """Показывает постоянный нижний блок со справкой и авторством."""
 
@@ -2865,7 +2947,7 @@ def _render_footer(st: Any) -> None:
 4. Нажмите **Найти расписание**.
 5. Раскрывайте только нужные разделы: расписание, ошибки нагрузки, возможные подстановки или накладки.
 6. Жёлтый значок **⚠** означает, что ФИО однозначно восстановлено по нагрузке. Только такие подстановки добавляются в XLSX; неоднозначные варианты остаются на сайте.
-7. Сверка нагрузки выполняется в обе стороны: приложение также предупреждает, если занятие осталось в расписании у преподавателя, но в нагрузке уже передано другому.
+7. Сверка нагрузки выполняется в обе стороны: если занятие осталось в расписании у преподавателя, но в нагрузке уже передано другому, оно получает красную отметку на сайте и в XLSX.
 8. Красным цветом отмечаются два и более занятия преподавателя в одно время и на пересекающихся учебных неделях. Практики разных групп считаются отдельно, а общая лекция нескольких групп остаётся одним занятием.
 9. Блок **Накладки аудиторий** показывает, если один кабинет одновременно занят разными занятиями. Общая лекция одного предмета для нескольких групп исключается из предупреждений.
 10. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную сетку и отдельный лист с найденными накладками аудиторий.
@@ -3061,7 +3143,7 @@ def _render_app(st: Any) -> None:
         expanded=True,
     ):
         st.dataframe(
-            display_df.reindex(columns=DISPLAY_COLUMNS),
+            _style_schedule_table(display_df.reindex(columns=DISPLAY_COLUMNS)),
             width="stretch",
             hide_index=True,
             row_height=schedule_row_height,
@@ -3073,8 +3155,10 @@ def _render_app(st: Any) -> None:
             expanded=False,
         ):
             st.dataframe(
-                display_df[display_df[CONFLICT_COLUMN].astype(bool)].reindex(
-                    columns=DISPLAY_COLUMNS
+                _style_schedule_table(
+                    display_df[display_df[CONFLICT_COLUMN].astype(bool)].reindex(
+                        columns=DISPLAY_COLUMNS
+                    )
                 ),
                 width="stretch",
                 hide_index=True,
