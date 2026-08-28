@@ -50,8 +50,16 @@ GROUP_BLOCK_SIZE: Final[int] = 5
 SESSION_CACHE_KEY: Final[str] = "_schedule_excel_cache"
 PARSED_SCHEDULE_CACHE_KEY: Final[str] = "_parsed_schedule_cache"
 MAX_CACHED_FILES: Final[int] = 20
-APP_VERSION: Final[str] = "1.8.1"
+APP_VERSION: Final[str] = "1.8.2"
 APP_CHANGELOG: Final[tuple[tuple[str, str, tuple[str, ...]], ...]] = (
+    (
+        "1.8.2",
+        "29.08.2026",
+        (
+            "Сверка нагрузки стала двусторонней.",
+            "Показываются занятия, оставшиеся в расписании у преподавателя после передачи нагрузки другому.",
+        ),
+    ),
     (
         "1.8.1",
         "29.08.2026",
@@ -1663,6 +1671,106 @@ def _suggested_teacher_conflicts(
     return "\n".join(conflicts)
 
 
+def _find_transferred_workload_issues(
+    workload: pd.DataFrame,
+    schedule: pd.DataFrame,
+    normalized_queries: Sequence[tuple[str, str]],
+) -> list[dict[str, str]]:
+    """Находит занятия, оставшиеся в расписании после передачи нагрузки."""
+
+    assignment_columns = [
+        "__discipline_key",
+        "__lesson_type_key",
+        "__group_key",
+    ]
+    workload_by_assignment = {
+        tuple(clean_cell(value) for value in key): assignment
+        for key, assignment in workload.groupby(
+            assignment_columns,
+            sort=False,
+            dropna=False,
+        )
+    }
+    selected_schedule = schedule[
+        schedule["__lesson_type_key"].isin(WORKLOAD_CLASS_TYPES)
+        & schedule[TEACHER_COLUMN].map(
+            lambda teacher: any(
+                normalized_query in _normalize_search_text(teacher)
+                for _, normalized_query in normalized_queries
+            )
+        )
+    ]
+
+    issues: list[dict[str, str]] = []
+    schedule_columns = [*assignment_columns, TEACHER_COLUMN]
+    for key, candidates in selected_schedule.groupby(
+        schedule_columns,
+        sort=False,
+        dropna=False,
+    ):
+        discipline_key, lesson_type, group, scheduled_teacher = (
+            clean_cell(value) for value in key
+        )
+        assignment = workload_by_assignment.get((discipline_key, lesson_type, group))
+        if assignment is None:
+            continue
+
+        expected_teachers = [
+            teacher
+            for teacher in dict.fromkeys(
+                clean_cell(value)
+                for value in assignment["Преподаватель нагрузки"].tolist()
+            )
+            if teacher
+        ]
+        if not expected_teachers:
+            continue
+
+        scheduled_tokens = set(
+            NAME_TOKEN_PATTERN.findall(_normalize_search_text(scheduled_teacher))
+        )
+        expected_surnames = {
+            surname
+            for surname in map(_teacher_surname_key, expected_teachers)
+            if surname
+        }
+        if scheduled_tokens.intersection(expected_surnames):
+            continue
+
+        # Если в одном поиске указаны обе стороны передачи, исходная проверка
+        # нагрузки уже показывает это расхождение — второй дубль не нужен.
+        if any(
+            normalized_query in _normalize_search_text(expected_teacher)
+            for _, normalized_query in normalized_queries
+            for expected_teacher in expected_teachers
+        ):
+            continue
+
+        first = assignment.iloc[0]
+        semesters = ", ".join(
+            dict.fromkeys(clean_cell(value) for value in assignment["Семестр"].tolist())
+        )
+        issues.append(
+            {
+                "Статус": "❌ Передача нагрузки",
+                "Проблема": (
+                    "Занятие осталось в расписании, но по нагрузке "
+                    "передано другому преподавателю"
+                ),
+                "Преподаватели по нагрузке": ", ".join(expected_teachers),
+                "Дисциплина": clean_cell(first["Дисциплина"]),
+                "Вид занятий": lesson_type,
+                "Группа": group,
+                "Семестр": semesters,
+                "ФИО в расписании": scheduled_teacher,
+                "Предлагаемое ФИО": "",
+                "Возможная накладка": "",
+                "Возможное место в расписании": _schedule_place(candidates),
+            }
+        )
+    return issues
+
+
 def audit_workload(
     workload: pd.DataFrame,
     schedule_records: pd.DataFrame,
@@ -1716,10 +1824,16 @@ def audit_workload(
     prepared_workload["__discipline_key"] = prepared_workload["Дисциплина"].map(
         _normalize_discipline
     )
+    prepared_workload["__lesson_type_key"] = prepared_workload["Вид занятий"].map(
+        _normalize_lesson_type
+    )
+    prepared_workload["__group_key"] = prepared_workload["Группа"].map(
+        lambda value: clean_cell(value).upper()
+    )
     assignment_columns = [
         "__discipline_key",
-        "Вид занятий",
-        "Группа",
+        "__lesson_type_key",
+        "__group_key",
         "Семестр",
     ]
 
@@ -1946,6 +2060,14 @@ def audit_workload(
                 "Возможное место в расписании": _schedule_place(exact_candidates),
             }
         )
+
+    transferred_issues = _find_transferred_workload_issues(
+        prepared_workload,
+        schedule,
+        normalized_queries,
+    )
+    error_records.extend(transferred_issues)
+    checked_assignments += len(transferred_issues)
 
     errors = pd.DataFrame.from_records(error_records, columns=WORKLOAD_ISSUE_COLUMNS)
     suggestions = pd.DataFrame.from_records(
@@ -2653,7 +2775,7 @@ def _render_workload_audit(
         return
 
     summary_columns = st.columns(5)
-    summary_columns[0].metric("Назначений", audit.checked_assignments)
+    summary_columns[0].metric("Проверено", audit.checked_assignments)
     summary_columns[1].metric("Совпало", audit.matched_assignments)
     summary_columns[2].metric("Ошибок", len(audit.errors.index))
     summary_columns[3].metric("Возможных мест", len(audit.suggestions.index))
@@ -2743,9 +2865,10 @@ def _render_footer(st: Any) -> None:
 4. Нажмите **Найти расписание**.
 5. Раскрывайте только нужные разделы: расписание, ошибки нагрузки, возможные подстановки или накладки.
 6. Жёлтый значок **⚠** означает, что ФИО однозначно восстановлено по нагрузке. Только такие подстановки добавляются в XLSX; неоднозначные варианты остаются на сайте.
-7. Красным цветом отмечаются два и более занятия преподавателя в одно время и на пересекающихся учебных неделях. Практики разных групп считаются отдельно, а общая лекция нескольких групп остаётся одним занятием.
-8. Блок **Накладки аудиторий** показывает, если один кабинет одновременно занят разными занятиями. Общая лекция одного предмета для нескольких групп исключается из предупреждений.
-9. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную сетку и отдельный лист с найденными накладками аудиторий.
+7. Сверка нагрузки выполняется в обе стороны: приложение также предупреждает, если занятие осталось в расписании у преподавателя, но в нагрузке уже передано другому.
+8. Красным цветом отмечаются два и более занятия преподавателя в одно время и на пересекающихся учебных неделях. Практики разных групп считаются отдельно, а общая лекция нескольких групп остаётся одним занятием.
+9. Блок **Накладки аудиторий** показывает, если один кабинет одновременно занят разными занятиями. Общая лекция одного предмета для нескольких групп исключается из предупреждений.
+10. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную сетку и отдельный лист с найденными накладками аудиторий.
 
 **Как это работает:** приложение написано на Python и Streamlit. Pandas читает загруженные Excel-файлы, очищает объединённые и «грязные» ячейки, после чего поиск собирает занятия выбранных преподавателей из всех курсов.
                 """
