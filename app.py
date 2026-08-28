@@ -44,8 +44,18 @@ FIRST_GROUP_COLUMN: Final[int] = 5
 GROUP_BLOCK_SIZE: Final[int] = 5
 SESSION_CACHE_KEY: Final[str] = "_schedule_excel_cache"
 MAX_CACHED_FILES: Final[int] = 20
-APP_VERSION: Final[str] = "1.4.0"
+APP_VERSION: Final[str] = "1.5.0"
 APP_CHANGELOG: Final[tuple[tuple[str, str, tuple[str, ...]], ...]] = (
+    (
+        "1.5.0",
+        "28.08.2026",
+        (
+            "Сверка нагрузки ограничена только введёнными преподавателями.",
+            "Однозначные подстановки ФИО добавляются в XLSX и помечаются жёлтым.",
+            "Возможные накладки выделяются в XLSX красным цветом.",
+            "Расписание, ошибки, подстановки и накладки можно сворачивать.",
+        ),
+    ),
     (
         "1.4.0",
         "28.08.2026",
@@ -92,6 +102,7 @@ QUERY_COLUMN: Final[str] = "Искомый преподаватель"
 TEACHER_COLUMN: Final[str] = "Преподаватель"
 SOURCE_COLUMN: Final[str] = "Файл-источник"
 CONFLICT_COLUMN: Final[str] = "Накладка"
+SUGGESTED_COLUMN: Final[str] = "Подстановка из нагрузки"
 WORKLOAD_CLASS_TYPES: Final[frozenset[str]] = frozenset({"ЛК", "ПР"})
 
 OUTPUT_COLUMNS: Final[list[str]] = [
@@ -108,6 +119,7 @@ OUTPUT_COLUMNS: Final[list[str]] = [
 INTERNAL_COLUMNS: Final[list[str]] = [
     QUERY_COLUMN,
     TEACHER_COLUMN,
+    SUGGESTED_COLUMN,
     *OUTPUT_COLUMNS,
     SOURCE_COLUMN,
 ]
@@ -144,6 +156,7 @@ WORKLOAD_ISSUE_COLUMNS: Final[list[str]] = [
 DISPLAY_COLUMNS: Final[list[str]] = [
     QUERY_COLUMN,
     TEACHER_COLUMN,
+    SUGGESTED_COLUMN,
     "День недели",
     "Пара",
     "Время",
@@ -242,6 +255,7 @@ class WorkloadAuditResult:
     matched_assignments: int
     errors: pd.DataFrame
     suggestions: pd.DataFrame
+    suggested_records: pd.DataFrame
 
 
 def _is_missing(value: Any) -> bool:
@@ -723,9 +737,13 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
                     "discipline": lesson_values[1],
                     "lesson_type": lesson_values[2],
                     "auditorium": lesson_values[3],
+                    "suggested": False,
                     "groups": [],
                     "sources": [],
                 },
+            )
+            lesson["suggested"] = lesson["suggested"] or bool(
+                clean_cell(record[SUGGESTED_COLUMN])
             )
             group = clean_cell(record["Группа"])
             source = clean_cell(record[SOURCE_COLUMN])
@@ -736,9 +754,14 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
 
         lessons = list(logical_lessons.values())
         first_record = slot_records.iloc[0]
+        distinct_disciplines = {
+            _normalize_discipline(lesson["discipline"])
+            for lesson in lessons
+            if _normalize_discipline(lesson["discipline"])
+        }
         conflict_text = (
-            f"⚠ {_lesson_count_text(len(lessons))} одновременно"
-            if len(lessons) > 1
+            f"⚠ {_lesson_count_text(len(distinct_disciplines))} одновременно"
+            if len(distinct_disciplines) > 1
             else ""
         )
         display_records.append(
@@ -747,6 +770,11 @@ def collapse_schedule_conflicts(records: pd.DataFrame) -> pd.DataFrame:
                 TEACHER_COLUMN: _join_unique(
                     slot_records[TEACHER_COLUMN].tolist(),
                     separator="\n",
+                ),
+                SUGGESTED_COLUMN: (
+                    "⚠ ФИО подставлено из нагрузки"
+                    if any(lesson["suggested"] for lesson in lessons)
+                    else ""
                 ),
                 "День недели": clean_cell(first_record["День недели"]),
                 "Пара": clean_cell(first_record["Пара"]),
@@ -871,6 +899,9 @@ def _filter_schedule_records(
             if normalized_query not in normalized_teacher:
                 continue
             filtered_records.append({QUERY_COLUMN: query, **record})
+
+    for record in filtered_records:
+        record[SUGGESTED_COLUMN] = ""
 
     result = pd.DataFrame.from_records(filtered_records, columns=INTERNAL_COLUMNS)
     return sort_internal_schedule(result, queries)
@@ -1159,11 +1190,15 @@ def _suggested_teacher_conflicts(
 def audit_workload(
     workload: pd.DataFrame,
     schedule_records: pd.DataFrame,
+    teacher_queries: Sequence[str],
 ) -> WorkloadAuditResult:
-    """Сверяет назначения нагрузки с дисциплинами и ФИО в расписании."""
+    """Сверяет только назначения выбранных преподавателей с расписанием."""
 
     if workload.empty:
         raise WorkloadFormatError("После фильтрации файл нагрузки пуст.")
+    queries = parse_teacher_queries(teacher_queries)
+    if not queries:
+        raise ValueError("Введите хотя бы одну фамилию для сверки нагрузки.")
 
     schedule = schedule_records.reindex(columns=ALL_SCHEDULE_COLUMNS).copy()
     schedule["__discipline_key"] = schedule["Дисциплина"].map(_normalize_discipline)
@@ -1185,6 +1220,7 @@ def audit_workload(
 
     error_records: list[dict[str, str]] = []
     suggestion_records: list[dict[str, str]] = []
+    suggested_schedule_records: list[dict[str, str]] = []
     matched_assignments = 0
     checked_assignments = 0
 
@@ -1193,7 +1229,6 @@ def audit_workload(
         sort=False,
         dropna=False,
     ):
-        checked_assignments += 1
         first = assignment.iloc[0]
         discipline = clean_cell(first["Дисциплина"])
         discipline_key = clean_cell(first["__discipline_key"])
@@ -1208,15 +1243,35 @@ def audit_workload(
             )
             if teacher
         ]
-        expected_teacher_text = ", ".join(expected_teachers)
-        expected_surnames = {
+        matching_queries = [
+            query
+            for query in queries
+            if any(
+                _normalize_search_text(query) in _normalize_search_text(teacher)
+                for teacher in expected_teachers
+            )
+        ]
+        if not matching_queries:
+            continue
+
+        relevant_teachers = [
+            teacher
+            for teacher in expected_teachers
+            if any(
+                _normalize_search_text(query) in _normalize_search_text(teacher)
+                for query in matching_queries
+            )
+        ]
+        relevant_teacher_text = ", ".join(relevant_teachers)
+        relevant_surnames = {
             surname
-            for surname in map(_teacher_surname_key, expected_teachers)
+            for surname in map(_teacher_surname_key, relevant_teachers)
             if surname
         }
+        checked_assignments += 1
 
         base_issue = {
-            "Преподаватели по нагрузке": expected_teacher_text,
+            "Преподаватели по нагрузке": relevant_teacher_text,
             "Дисциплина": discipline,
             "Вид занятий": lesson_type,
             "Группа": group,
@@ -1226,15 +1281,6 @@ def audit_workload(
             "Возможная накладка": "",
             "Возможное место в расписании": "",
         }
-        if not expected_teachers:
-            error_records.append(
-                {
-                    "Статус": "❌ Ошибка нагрузки",
-                    "Проблема": "В нагрузке не указан преподаватель",
-                    **base_issue,
-                }
-            )
-            continue
         if not group:
             error_records.append(
                 {
@@ -1280,7 +1326,7 @@ def audit_workload(
             for surname in map(_teacher_surname_key, scheduled_teachers)
             if surname
         }
-        if expected_surnames and expected_surnames.issubset(scheduled_surnames):
+        if relevant_surnames and relevant_surnames.issubset(scheduled_surnames):
             matched_assignments += 1
             continue
 
@@ -1316,6 +1362,29 @@ def audit_workload(
                     "Возможное место в расписании": _schedule_place(blank_candidates),
                 }
             )
+            if suggested_teacher:
+                for candidate in blank_candidates.to_dict(orient="records"):
+                    for query in matching_queries:
+                        if _normalize_search_text(query) not in _normalize_search_text(
+                            suggested_teacher
+                        ):
+                            continue
+                        suggested_schedule_records.append(
+                            {
+                                QUERY_COLUMN: query,
+                                TEACHER_COLUMN: suggested_teacher,
+                                SUGGESTED_COLUMN: ("⚠ ФИО подставлено из нагрузки"),
+                                "День недели": clean_cell(candidate["День недели"]),
+                                "Пара": clean_cell(candidate["Пара"]),
+                                "Время": clean_cell(candidate["Время"]),
+                                "Неделя": clean_cell(candidate["Неделя"]),
+                                "Группа": clean_cell(candidate["Группа"]),
+                                "Дисциплина": clean_cell(candidate["Дисциплина"]),
+                                "Вид занятий": clean_cell(candidate["Вид занятий"]),
+                                "Аудитория": clean_cell(candidate["Аудитория"]),
+                                SOURCE_COLUMN: clean_cell(candidate[SOURCE_COLUMN]),
+                            }
+                        )
             continue
 
         error_records.append(
@@ -1333,12 +1402,41 @@ def audit_workload(
         suggestion_records,
         columns=WORKLOAD_ISSUE_COLUMNS,
     )
+    suggested_records = pd.DataFrame.from_records(
+        suggested_schedule_records,
+        columns=INTERNAL_COLUMNS,
+    )
+    if not suggested_records.empty:
+        suggested_records = _deduplicate_batch_records(
+            suggested_records,
+            queries,
+        )
     return WorkloadAuditResult(
         checked_assignments=checked_assignments,
         matched_assignments=matched_assignments,
         errors=errors,
         suggestions=suggestions,
+        suggested_records=suggested_records,
     )
+
+
+def merge_workload_suggestions(
+    schedule_records: pd.DataFrame,
+    audit: WorkloadAuditResult | None,
+    teacher_queries: Sequence[str],
+) -> pd.DataFrame:
+    """Добавляет к выдаче только однозначные подстановки из нагрузки."""
+
+    if audit is None or audit.suggested_records.empty:
+        return schedule_records.reindex(columns=INTERNAL_COLUMNS)
+    combined = pd.concat(
+        [
+            schedule_records.reindex(columns=INTERNAL_COLUMNS),
+            audit.suggested_records.reindex(columns=INTERNAL_COLUMNS),
+        ],
+        ignore_index=True,
+    )
+    return _deduplicate_batch_records(combined, teacher_queries)
 
 
 def _pair_number(value: Any) -> int | None:
@@ -1436,12 +1534,16 @@ def _export_clusters_for_query(
                 "week_order": week_order,
                 "teacher_identity": key[3],
                 "teacher": clean_cell(record[TEACHER_COLUMN]),
+                "suggested": False,
                 "time": clean_cell(record["Время"]),
                 "discipline": clean_cell(record["Дисциплина"]),
                 "lesson_type": clean_cell(record["Вид занятий"]),
                 "auditorium": clean_cell(record["Аудитория"]),
                 "groups": [],
             },
+        )
+        cluster["suggested"] = cluster["suggested"] or bool(
+            clean_cell(record.get(SUGGESTED_COLUMN, ""))
         )
         group = clean_cell(record["Группа"])
         if group and group not in cluster["groups"]:
@@ -1514,6 +1616,8 @@ def build_schedule_xlsx(
         header_fill = PatternFill("solid", fgColor="D3DFE2")
         teacher_fill = PatternFill("solid", fgColor="75FB4C")
         white_fill = PatternFill("solid", fgColor="FFFFFF")
+        suggested_fill = PatternFill("solid", fgColor="FFF2CC")
+        conflict_fill = PatternFill("solid", fgColor="F4CCCC")
 
         teacher_starts = {
             4 + teacher_index * 4 for teacher_index in range(len(queries))
@@ -1657,17 +1761,27 @@ def build_schedule_xlsx(
                             ),
                             [],
                         )
-                        lesson_counts_by_teacher = Counter(
-                            cluster["teacher_identity"] for cluster in clusters
-                        )
+                        disciplines_by_teacher: dict[str, set[str]] = {}
+                        for cluster in clusters:
+                            discipline_key = _normalize_discipline(
+                                cluster["discipline"]
+                            )
+                            if discipline_key:
+                                disciplines_by_teacher.setdefault(
+                                    cluster["teacher_identity"],
+                                    set(),
+                                ).add(discipline_key)
                         conflicting_teachers = {
                             teacher_identity
-                            for teacher_identity, lesson_count in (
-                                lesson_counts_by_teacher.items()
+                            for teacher_identity, disciplines in (
+                                disciplines_by_teacher.items()
                             )
-                            if lesson_count > 1
+                            if len(disciplines) > 1
                         }
                         has_overlap = bool(conflicting_teachers)
+                        has_suggestion = any(
+                            cluster["suggested"] for cluster in clusters
+                        )
                         maximum_lines = max(maximum_lines, len(clusters))
                         disciplines = [cluster["discipline"] for cluster in clusters]
                         if has_overlap and disciplines:
@@ -1675,6 +1789,15 @@ def build_schedule_xlsx(
                                 index
                                 for index, cluster in enumerate(clusters)
                                 if cluster["teacher_identity"] in conflicting_teachers
+                            )
+                            disciplines[warning_index] = (
+                                f"⚠ {disciplines[warning_index]}"
+                            )
+                        elif has_suggestion and disciplines:
+                            warning_index = next(
+                                index
+                                for index, cluster in enumerate(clusters)
+                                if cluster["suggested"]
                             )
                             disciplines[warning_index] = (
                                 f"⚠ {disciplines[warning_index]}"
@@ -1701,12 +1824,23 @@ def build_schedule_xlsx(
                                 start_column + offset,
                                 conflict=has_overlap,
                             )
+                            if has_overlap:
+                                data_cell.fill = conflict_fill
+                            elif has_suggestion:
+                                data_cell.fill = suggested_fill
                             if has_overlap and offset == 0:
                                 data_cell.font = Font(
                                     name="Arial",
                                     size=10,
                                     bold=True,
                                     color="C00000",
+                                )
+                            elif has_suggestion and offset == 0:
+                                data_cell.font = Font(
+                                    name="Arial",
+                                    size=10,
+                                    bold=True,
+                                    color="9C6500",
                                 )
 
                     if maximum_lines:
@@ -1785,17 +1919,24 @@ def _render_workload_audit(
     st: Any,
     audit: WorkloadAuditResult,
     academic_term: str,
+    teacher_queries: Sequence[str],
 ) -> None:
-    """Показывает результаты нагрузки отдельно от основного расписания."""
+    """Показывает сворачиваемую сверку только выбранных преподавателей."""
 
     st.subheader("Сверка с учебной нагрузкой")
     parity_text = (
         "нечётные" if _normalize_search_text(academic_term) == "осень" else "чётные"
     )
+    teacher_text = ", ".join(parse_teacher_queries(teacher_queries))
     st.caption(
-        f"Проверены {parity_text} семестры. Предположения этого блока "
-        "не добавляются в XLSX-выгрузку."
+        f"Проверены только преподаватели: {teacher_text}; {parity_text} семестры. "
+        "В XLSX добавляются только однозначные подстановки ФИО в уже существующие "
+        "занятия расписания."
     )
+    if audit.checked_assignments == 0:
+        st.info("В нагрузке не найдены назначения выбранных преподавателей.")
+        return
+
     summary_columns = st.columns(4)
     summary_columns[0].metric("Назначений", audit.checked_assignments)
     summary_columns[1].metric("Совпало", audit.matched_assignments)
@@ -1806,32 +1947,57 @@ def _render_workload_audit(
         st.success("Нагрузка соответствует загруженному расписанию.")
         return
     if not audit.errors.empty:
-        st.error(
-            f"Ошибки сверки нагрузки: {len(audit.errors.index)}. "
-            "Эти строки требуют проверки исходных файлов."
-        )
-        st.dataframe(
-            audit.errors,
-            use_container_width=True,
-            hide_index=True,
-            row_height=54,
-        )
+        with st.expander(
+            f"❌ Ошибки сверки нагрузки ({len(audit.errors.index)})",
+            expanded=False,
+        ):
+            st.caption("Показаны замечания только по введённым преподавателям.")
+            st.dataframe(
+                audit.errors,
+                use_container_width=True,
+                hide_index=True,
+                row_height=54,
+            )
     if not audit.suggestions.empty:
-        possible_conflicts = int(
-            audit.suggestions["Возможная накладка"].astype(bool).sum()
+        conflict_mask = audit.suggestions["Возможная накладка"].map(
+            lambda value: bool(clean_cell(value))
         )
-        message = (
-            f"Возможные места для отсутствующих ФИО: {len(audit.suggestions.index)}."
-        )
-        if possible_conflicts:
-            message += f" Возможных накладок после подстановки: {possible_conflicts}."
-        st.warning(message)
-        st.dataframe(
-            audit.suggestions,
-            use_container_width=True,
-            hide_index=True,
-            row_height=70,
-        )
+        possible_conflicts = audit.suggestions[conflict_mask]
+        other_suggestions = audit.suggestions[~conflict_mask]
+        if not other_suggestions.empty:
+            with st.expander(
+                f"⚠ Возможные места и подстановки ({len(other_suggestions.index)})",
+                expanded=False,
+            ):
+                st.caption(
+                    "Однозначная подстановка попадает в XLSX; неоднозначная "
+                    "остаётся только подсказкой на сайте."
+                )
+                st.dataframe(
+                    other_suggestions,
+                    use_container_width=True,
+                    hide_index=True,
+                    row_height=70,
+                )
+        if not possible_conflicts.empty:
+            with st.expander(
+                f"🔴 Возможные накладки после подстановки "
+                f"({len(possible_conflicts.index)})",
+                expanded=False,
+            ):
+                st.dataframe(
+                    possible_conflicts,
+                    use_container_width=True,
+                    hide_index=True,
+                    row_height=70,
+                )
+
+        exported_count = len(audit.suggested_records.index)
+        if exported_count:
+            st.warning(
+                f"В сводное расписание добавлено однозначно восстановленных "
+                f"строк: {exported_count}. Они отмечены знаком ⚠ и цветом."
+            )
 
 
 def _render_footer(st: Any) -> None:
@@ -1848,8 +2014,10 @@ def _render_footer(st: Any) -> None:
 2. При необходимости загрузите отдельный файл нагрузки и выберите **Осень** или **Весна**.
 3. Введите фамилии преподавателей — каждую с новой строки либо через запятую.
 4. Нажмите **Найти расписание**.
-5. Проверьте расписание и отдельный блок сверки нагрузки. Жёлтый значок **⚠** показывает возможное место для отсутствующего ФИО; такие предположения не попадают в XLSX.
-6. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную Excel-таблицу.
+5. Раскрывайте только нужные разделы: расписание, ошибки нагрузки, возможные подстановки или накладки.
+6. Жёлтый значок **⚠** означает, что ФИО однозначно восстановлено по нагрузке. Только такие подстановки добавляются в XLSX; неоднозначные варианты остаются на сайте.
+7. Красным цветом отмечаются разные дисциплины одного преподавателя в одно время.
+8. Нажмите **Скачать сводное расписание XLSX**, чтобы получить цветную Excel-таблицу.
 
 **Как это работает:** приложение написано на Python и Streamlit. Pandas читает загруженные Excel-файлы, очищает объединённые и «грязные» ячейки, после чего поиск собирает занятия выбранных преподавателей из всех курсов.
                 """
@@ -1915,10 +2083,8 @@ def _render_app(st: Any) -> None:
         st.info("Сначала загрузите хотя бы один Excel-файл с расписанием.")
         return
     teacher_queries = parse_teacher_queries(teacher_input)
-    if not teacher_queries and workload_file is None:
-        st.warning(
-            "Введите хотя бы одну фамилию преподавателя или загрузите файл нагрузки."
-        )
+    if not teacher_queries:
+        st.warning("Введите хотя бы одну фамилию преподавателя.")
         return
 
     with st.spinner("Читаю файл и ищу занятия…"):
@@ -1954,6 +2120,7 @@ def _render_app(st: Any) -> None:
                 workload_audit = audit_workload(
                     workload,
                     batch_result.all_records,
+                    teacher_queries,
                 )
             except (ScheduleError, ValueError) as exc:
                 workload_error = str(exc)
@@ -1980,15 +2147,18 @@ def _render_app(st: Any) -> None:
     if workload_error:
         st.error(f"Ошибка файла нагрузки: {workload_error}")
     elif workload_audit is not None:
-        _render_workload_audit(st, workload_audit, academic_term)
-
-    result_df = batch_result.records
-    if not teacher_queries:
-        st.info(
-            "Сверка нагрузки завершена. Для вывода персонального расписания "
-            "введите фамилию преподавателя."
+        _render_workload_audit(
+            st,
+            workload_audit,
+            academic_term,
+            teacher_queries,
         )
-        return
+
+    result_df = merge_workload_suggestions(
+        batch_result.records,
+        workload_audit,
+        teacher_queries,
+    )
     if result_df.empty:
         st.warning("Занятия указанных преподавателей не найдены.")
         return
@@ -2016,12 +2186,30 @@ def _render_app(st: Any) -> None:
             "временного слота показаны вместе в одной строке."
         )
 
-    st.dataframe(
-        display_df.reindex(columns=DISPLAY_COLUMNS),
-        use_container_width=True,
-        hide_index=True,
-        row_height=54 if conflict_count else None,
-    )
+    with st.expander(
+        f"Расписание ({len(display_df.index)} строк)",
+        expanded=True,
+    ):
+        st.dataframe(
+            display_df.reindex(columns=DISPLAY_COLUMNS),
+            use_container_width=True,
+            hide_index=True,
+            row_height=54 if conflict_count else None,
+        )
+
+    if conflict_count:
+        with st.expander(
+            f"🔴 Накладки выбранных преподавателей ({conflict_count})",
+            expanded=False,
+        ):
+            st.dataframe(
+                display_df[display_df[CONFLICT_COLUMN].astype(bool)].reindex(
+                    columns=DISPLAY_COLUMNS
+                ),
+                use_container_width=True,
+                hide_index=True,
+                row_height=70,
+            )
 
     try:
         export_bytes = build_schedule_xlsx(result_df, teacher_queries)
