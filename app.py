@@ -9,6 +9,7 @@ from collections import Counter
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, time
+from functools import lru_cache
 from hashlib import sha256
 from io import BytesIO
 from numbers import Real
@@ -49,9 +50,23 @@ FIRST_GROUP_COLUMN: Final[int] = 5
 GROUP_BLOCK_SIZE: Final[int] = 5
 SESSION_CACHE_KEY: Final[str] = "_schedule_excel_cache"
 PARSED_SCHEDULE_CACHE_KEY: Final[str] = "_parsed_schedule_cache"
+WORKLOAD_CACHE_KEY: Final[str] = "_workload_cache"
+WORKLOAD_AUDIT_CACHE_KEY: Final[str] = "_workload_audit_cache"
+SEARCH_ARTIFACT_CACHE_KEY: Final[str] = "_search_artifact_cache"
+EXPORT_CACHE_KEY: Final[str] = "_schedule_export_cache"
 MAX_CACHED_FILES: Final[int] = 20
-APP_VERSION: Final[str] = "1.8.4"
+MAX_CACHED_RESULTS: Final[int] = 12
+APP_VERSION: Final[str] = "1.9.0"
 APP_CHANGELOG: Final[tuple[tuple[str, str, tuple[str, ...]], ...]] = (
+    (
+        "1.9.0",
+        "30.08.2026",
+        (
+            "Добавлен ограниченный сессионный кэш сверки нагрузки и готовых результатов.",
+            "Повторные действия на странице больше не пересобирают одни и те же таблицы и XLSX.",
+            "Кэш не дублирует тяжёлый полный набор расписания для каждого запроса.",
+        ),
+    ),
     (
         "1.8.4",
         "29.08.2026",
@@ -364,6 +379,15 @@ class WorkloadAuditResult:
     potential_conflicts: pd.DataFrame
 
 
+@dataclass(frozen=True, slots=True)
+class SearchArtifacts:
+    """Подготовленные данные результата, безопасные для повторного rerun."""
+
+    result: pd.DataFrame
+    display: pd.DataFrame
+    room_conflicts: pd.DataFrame
+
+
 def _is_missing(value: Any) -> bool:
     """Безопасно проверяет скалярное значение ячейки на пропуск."""
 
@@ -377,9 +401,19 @@ def _is_missing(value: Any) -> bool:
         return False
 
 
+@lru_cache(maxsize=8192)
+def _clean_text_cell(value: str) -> str:
+    """Очищает повторяющиеся строковые ячейки с ограниченным кэшем."""
+
+    text = value.replace("\r", " ").replace("\n", " ").replace("\xa0", " ")
+    return WHITESPACE_PATTERN.sub(" ", text).strip()
+
+
 def clean_cell(value: Any) -> str:
     """Преобразует значение Excel-ячейки в чистую однострочную строку."""
 
+    if isinstance(value, str):
+        return _clean_text_cell(value)
     if _is_missing(value):
         return ""
 
@@ -389,8 +423,70 @@ def clean_cell(value: Any) -> str:
         if math.isfinite(numeric_value) and numeric_value.is_integer():
             return str(int(numeric_value))
 
-    text = str(value).replace("\r", " ").replace("\n", " ").replace("\xa0", " ")
-    return WHITESPACE_PATTERN.sub(" ", text).strip()
+    return _clean_text_cell(str(value))
+
+
+def _get_session_cache_entry(
+    session_state: MutableMapping[str, Any],
+    cache_name: str,
+    entry_key: str,
+) -> Any | None:
+    """Возвращает LRU-запись небольшого сессионного кэша."""
+
+    cached_value = session_state.get(cache_name)
+    if not isinstance(cached_value, dict):
+        return None
+    cache = {key: value for key, value in cached_value.items() if isinstance(key, str)}
+    if entry_key not in cache:
+        return None
+    value = cache.pop(entry_key)
+    cache[entry_key] = value
+    session_state[cache_name] = cache
+    return value
+
+
+def _put_session_cache_entry(
+    session_state: MutableMapping[str, Any],
+    cache_name: str,
+    entry_key: str,
+    value: Any,
+    *,
+    maximum_entries: int = MAX_CACHED_RESULTS,
+) -> None:
+    """Сохраняет запись и ограничивает размер сессионного LRU-кэша."""
+
+    cached_value = session_state.get(cache_name)
+    cache = (
+        {key: cached for key, cached in cached_value.items() if isinstance(key, str)}
+        if isinstance(cached_value, dict)
+        else {}
+    )
+    cache.pop(entry_key, None)
+    cache[entry_key] = value
+    while len(cache) > maximum_entries:
+        cache.pop(next(iter(cache)))
+    session_state[cache_name] = cache
+
+
+def _payloads_signature(files: Sequence[tuple[str, bytes]]) -> str:
+    """Строит устойчивую сигнатуру имён, порядка и содержимого файлов."""
+
+    digest = sha256()
+    for filename, content in files:
+        filename_bytes = clean_cell(filename).encode("utf-8")
+        digest.update(len(filename_bytes).to_bytes(4, "big"))
+        digest.update(filename_bytes)
+        digest.update(sha256(content).digest())
+    return digest.hexdigest()
+
+
+def _query_signature(teacher_queries: Sequence[str]) -> str:
+    """Строит ключ с учётом порядка введённых преподавателей."""
+
+    return "\0".join(
+        _normalize_search_text(query)
+        for query in parse_teacher_queries(teacher_queries)
+    )
 
 
 def _clean_multiline_cell(value: Any) -> str:
@@ -415,13 +511,27 @@ def _excel_safe_text(value: Any, *, multiline: bool = False) -> str:
 def _normalize_search_text(value: Any) -> str:
     """Нормализует регистр и русские е/ё только для сравнения строк."""
 
-    return clean_cell(value).casefold().replace("ё", "е")
+    return _normalize_search_string(clean_cell(value))
+
+
+@lru_cache(maxsize=8192)
+def _normalize_search_string(value: str) -> str:
+    """Кэширует нормализацию часто повторяющихся строк."""
+
+    return value.casefold().replace("ё", "е")
 
 
 def _normalize_discipline(value: Any) -> str:
     """Нормализует название дисциплины для сверки разных Excel-источников."""
 
-    text = WORKLOAD_SUBJECT_SUFFIX_PATTERN.sub("", clean_cell(value))
+    return _normalize_discipline_string(clean_cell(value))
+
+
+@lru_cache(maxsize=4096)
+def _normalize_discipline_string(value: str) -> str:
+    """Кэширует ключ дисциплины для повторяющихся строк расписания."""
+
+    text = WORKLOAD_SUBJECT_SUFFIX_PATTERN.sub("", value)
     normalized = _normalize_search_text(text)
     return " ".join(NAME_TOKEN_PATTERN.findall(normalized))
 
@@ -435,16 +545,30 @@ def _display_workload_discipline(value: Any) -> str:
 def _normalize_lesson_type(value: Any) -> str:
     """Приводит обозначения лекций и практик к ЛК/ПР."""
 
+    return _normalize_lesson_type_string(clean_cell(value))
+
+
+@lru_cache(maxsize=256)
+def _normalize_lesson_type_string(value: str) -> str:
+    """Кэширует нормализацию небольшого набора видов занятий."""
+
     normalized = _normalize_search_text(value)
     if normalized.startswith("лк") or normalized.startswith("лек"):
         return "ЛК"
     if normalized.startswith("пр") or normalized.startswith("практ"):
         return "ПР"
-    return clean_cell(value).upper()
+    return value.upper()
 
 
 def _teacher_surname_key(value: Any) -> str:
     """Возвращает нормализованную фамилию преподавателя."""
+
+    return _teacher_surname_string(clean_cell(value))
+
+
+@lru_cache(maxsize=4096)
+def _teacher_surname_string(value: str) -> str:
+    """Кэширует извлечение фамилии из повторяющихся ФИО."""
 
     tokens = NAME_TOKEN_PATTERN.findall(_normalize_search_text(value))
     return tokens[0] if tokens else ""
@@ -1629,6 +1753,45 @@ def parse_workload_file(
     )
 
 
+def _workload_signature(file_content: bytes, academic_term: str) -> str:
+    """Строит сигнатуру файла нагрузки и выбранной части учебного года."""
+
+    normalized_term = _normalize_search_text(academic_term)
+    digest = sha256()
+    digest.update(normalized_term.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(sha256(file_content).digest())
+    return digest.hexdigest()
+
+
+def read_workload_for_session(
+    file_content: bytes,
+    academic_term: str,
+    session_state: MutableMapping[str, Any],
+    signature: str | None = None,
+) -> pd.DataFrame:
+    """Кэширует разобранную нагрузку между повторными rerun Streamlit."""
+
+    workload_key = signature or _workload_signature(file_content, academic_term)
+    cache_key = f"{APP_VERSION}:{workload_key}"
+    cached = _get_session_cache_entry(
+        session_state,
+        WORKLOAD_CACHE_KEY,
+        cache_key,
+    )
+    if isinstance(cached, pd.DataFrame):
+        return cached
+
+    workload = parse_workload_file(file_content, academic_term)
+    _put_session_cache_entry(
+        session_state,
+        WORKLOAD_CACHE_KEY,
+        cache_key,
+        workload,
+    )
+    return workload
+
+
 def _schedule_place(records: pd.DataFrame) -> str:
     """Формирует краткое описание возможного места в расписании."""
 
@@ -2286,6 +2449,38 @@ def audit_workload(
     )
 
 
+def audit_workload_for_session(
+    workload: pd.DataFrame,
+    schedule_records: pd.DataFrame,
+    teacher_queries: Sequence[str],
+    session_state: MutableMapping[str, Any],
+    source_signature: str,
+) -> WorkloadAuditResult:
+    """Переиспользует готовую сверку при неизменных файлах и запросе."""
+
+    cache_key = sha256(
+        (
+            f"{APP_VERSION}\0{source_signature}\0{_query_signature(teacher_queries)}"
+        ).encode("utf-8")
+    ).hexdigest()
+    cached = _get_session_cache_entry(
+        session_state,
+        WORKLOAD_AUDIT_CACHE_KEY,
+        cache_key,
+    )
+    if isinstance(cached, WorkloadAuditResult):
+        return cached
+
+    audit = audit_workload(workload, schedule_records, teacher_queries)
+    _put_session_cache_entry(
+        session_state,
+        WORKLOAD_AUDIT_CACHE_KEY,
+        cache_key,
+        audit,
+    )
+    return audit
+
+
 def merge_workload_suggestions(
     schedule_records: pd.DataFrame,
     audit: WorkloadAuditResult | None,
@@ -2327,6 +2522,61 @@ def merge_all_schedule_suggestions(
         keep="first",
         ignore_index=True,
     )
+
+
+def prepare_search_artifacts_for_session(
+    schedule_records: pd.DataFrame,
+    all_schedule_records: pd.DataFrame,
+    workload_audit: WorkloadAuditResult | None,
+    teacher_queries: Sequence[str],
+    session_state: MutableMapping[str, Any],
+    source_signature: str,
+) -> SearchArtifacts:
+    """Кэширует итоговые таблицы и накладки для повторных rerun."""
+
+    cache_key = sha256(
+        (
+            f"{APP_VERSION}\0{source_signature}\0{_query_signature(teacher_queries)}"
+        ).encode("utf-8")
+    ).hexdigest()
+    cached = _get_session_cache_entry(
+        session_state,
+        SEARCH_ARTIFACT_CACHE_KEY,
+        cache_key,
+    )
+    if isinstance(cached, SearchArtifacts):
+        return cached
+
+    result = merge_workload_suggestions(
+        schedule_records,
+        workload_audit,
+        teacher_queries,
+    )
+    room_schedule_records = merge_all_schedule_suggestions(
+        all_schedule_records,
+        workload_audit,
+    )
+    room_conflicts = find_room_conflicts(
+        room_schedule_records,
+        teacher_queries,
+    )
+    display = (
+        collapse_schedule_conflicts(result)
+        if not result.empty
+        else pd.DataFrame(columns=DISPLAY_COLUMNS)
+    )
+    artifacts = SearchArtifacts(
+        result=result,
+        display=display,
+        room_conflicts=room_conflicts,
+    )
+    _put_session_cache_entry(
+        session_state,
+        SEARCH_ARTIFACT_CACHE_KEY,
+        cache_key,
+        artifacts,
+    )
+    return artifacts
 
 
 def _pair_number(value: Any) -> int | None:
@@ -2935,6 +3185,42 @@ def build_schedule_xlsx(
         ) from exc
 
 
+def build_schedule_xlsx_for_session(
+    records: pd.DataFrame,
+    teacher_queries: Sequence[str],
+    room_conflicts: pd.DataFrame,
+    session_state: MutableMapping[str, Any],
+    source_signature: str,
+) -> bytes:
+    """Переиспользует готовую XLSX-выгрузку при неизменном результате."""
+
+    cache_key = sha256(
+        (
+            f"{APP_VERSION}\0{source_signature}\0{_query_signature(teacher_queries)}"
+        ).encode("utf-8")
+    ).hexdigest()
+    cached = _get_session_cache_entry(
+        session_state,
+        EXPORT_CACHE_KEY,
+        cache_key,
+    )
+    if isinstance(cached, bytes):
+        return cached
+
+    export_bytes = build_schedule_xlsx(
+        records,
+        teacher_queries,
+        room_conflicts,
+    )
+    _put_session_cache_entry(
+        session_state,
+        EXPORT_CACHE_KEY,
+        cache_key,
+        export_bytes,
+    )
+    return export_bytes
+
+
 def _render_workload_audit(
     st: Any,
     audit: WorkloadAuditResult,
@@ -3138,13 +3424,15 @@ def _render_app(st: Any) -> None:
         st.warning("Введите хотя бы одну фамилию преподавателя.")
         return
 
+    schedule_payloads = [
+        (uploaded_file.name, uploaded_file.getvalue())
+        for uploaded_file in uploaded_files
+    ]
+    schedule_signature = _payloads_signature(schedule_payloads)
     with st.spinner("Читаю файл и ищу занятия…"):
         try:
             batch_result = parse_schedule_files(
-                [
-                    (uploaded_file.name, uploaded_file.getvalue())
-                    for uploaded_file in uploaded_files
-                ],
+                schedule_payloads,
                 teacher_queries,
                 st.session_state,
             )
@@ -3161,24 +3449,41 @@ def _render_app(st: Any) -> None:
 
     workload_audit: WorkloadAuditResult | None = None
     workload_error = ""
+    workload_result_signature = "no-workload"
     if workload_file is not None:
         with st.spinner("Сверяю учебную нагрузку с расписанием…"):
             try:
-                workload = parse_workload_file(
-                    workload_file.getvalue(),
+                workload_content = workload_file.getvalue()
+                workload_signature = _workload_signature(
+                    workload_content,
                     academic_term,
                 )
-                workload_audit = audit_workload(
+                workload_result_signature = f"workload:{workload_signature}"
+                workload = read_workload_for_session(
+                    workload_content,
+                    academic_term,
+                    st.session_state,
+                    workload_signature,
+                )
+                workload_audit = audit_workload_for_session(
                     workload,
                     batch_result.all_records,
                     teacher_queries,
+                    st.session_state,
+                    f"{schedule_signature}:{workload_signature}",
                 )
             except (ScheduleError, ValueError) as exc:
                 workload_error = str(exc)
+                workload_result_signature = (
+                    f"workload-error:{workload_result_signature}:{workload_error}"
+                )
             except Exception:
                 LOGGER.exception("Непредвиденная ошибка сверки нагрузки")
                 workload_error = (
                     "Не удалось сверить нагрузку из-за непредвиденной ошибки."
+                )
+                workload_result_signature = (
+                    f"workload-error:{workload_result_signature}:unexpected"
                 )
 
     if batch_result.errors:
@@ -3205,19 +3510,17 @@ def _render_app(st: Any) -> None:
             teacher_queries,
         )
 
-    result_df = merge_workload_suggestions(
+    result_signature = f"{schedule_signature}:{workload_result_signature}"
+    search_artifacts = prepare_search_artifacts_for_session(
         batch_result.records,
-        workload_audit,
-        teacher_queries,
-    )
-    room_schedule_records = merge_all_schedule_suggestions(
         batch_result.all_records,
         workload_audit,
-    )
-    room_conflicts = find_room_conflicts(
-        room_schedule_records,
         teacher_queries,
+        st.session_state,
+        result_signature,
     )
+    result_df = search_artifacts.result
+    room_conflicts = search_artifacts.room_conflicts
     if result_df.empty:
         st.warning("Занятия указанных преподавателей не найдены.")
         return
@@ -3237,7 +3540,7 @@ def _render_app(st: Any) -> None:
     if missing_queries:
         st.info("Без совпадений: " + ", ".join(missing_queries))
 
-    display_df = collapse_schedule_conflicts(result_df)
+    display_df = search_artifacts.display
     conflict_count = int(display_df[CONFLICT_COLUMN].astype(bool).sum())
     maximum_lessons_per_slot = max(
         (
@@ -3314,10 +3617,12 @@ def _render_app(st: Any) -> None:
             )
 
     try:
-        export_bytes = build_schedule_xlsx(
+        export_bytes = build_schedule_xlsx_for_session(
             result_df,
             teacher_queries,
             room_conflicts,
+            st.session_state,
+            result_signature,
         )
     except ScheduleError as exc:
         st.error(str(exc))
